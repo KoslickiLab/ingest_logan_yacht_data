@@ -1,5 +1,8 @@
 import pandas as pd
+import sys
 import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def process_geo_data():
     print("Reading SRA_Accessions file...")

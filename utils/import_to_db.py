@@ -1,4 +1,5 @@
 import os
+import sys
 import tarfile
 import tempfile
 import duckdb
@@ -8,16 +9,55 @@ import shutil
 import zipfile
 import gzip
 import json
+import argparse
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from config import Config
-from cli_args import parse_processing_args
+
+def parse_processing_args():
+    """Parse command line arguments for import_to_db.py"""
+    parser = argparse.ArgumentParser(
+        description='Process functional profile data archives',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    python utils/import_to_db.py --data-dir ./my_data --workers 8
+    python utils/import_to_db.py --database custom.db --no-signatures
+    python utils/import_to_db.py --batch-size 5000 --no-progress
+        """)
+    
+    parser.add_argument('--data-dir', 
+                       help=f'Data directory containing .tar.gz files (default: {Config.DATA_DIR})')
+    parser.add_argument('--database', '--db', 
+                       help=f'Output database path (default: {Config.DATABASE_PATH})')
+    
+    parser.add_argument('--no-signatures', action='store_true', 
+                       help='Skip signature processing')
+    parser.add_argument('--no-taxa', action='store_true', 
+                       help='Skip taxa profiles processing')
+    parser.add_argument('--no-gather', action='store_true', 
+                       help='Skip gather files processing')
+    
+    parser.add_argument('--workers', type=int, 
+                       help=f'Number of worker threads (default: {Config.MAX_WORKERS})')
+    parser.add_argument('--batch-size', type=int, 
+                       help=f'Batch size for processing (default: {Config.BATCH_SIZE})')
+    
+    parser.add_argument('--no-progress', action='store_true',
+                       help='Disable progress bars')
+    parser.add_argument('--continue-on-error', action='store_true',
+                       help='Continue processing on errors')
+    
+    return parser.parse_args()
 
 def setup_logger():
     """Set up logger to write to both file and console"""
-    logs_dir = Config.get_log_dir()
+    logs_dir = os.path.join(os.getcwd(), 'logs')
     os.makedirs(logs_dir, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -587,87 +627,156 @@ def process_taxa_profiles(taxa_profiles_dir, db_path="functional_profile.db"):
         sample_id = match
         
         try:
-            df = pd.read_excel(file_path)
+            # Read all sheets from Excel file
+            all_sheets = pd.read_excel(file_path, sheet_name=None)
             
-            if df.empty:
-                logging.warning(f"Skipping empty Excel file: {file_name}")
+            if not all_sheets:
+                logging.warning(f"No sheets found in Excel file: {file_name}")
                 continue
             
-            df['sample_id'] = sample_id
-            
-            if 'organism_name' in df.columns:
-                df['organism_id'] = df['organism_name'].str.extract(r'^(GC[AF]_\d+\.\d+)', expand=False)
+            # Process each sheet
+            file_dataframes = []
+            for sheet_name, df in all_sheets.items():
+                logging.info(f"Processing sheet '{sheet_name}' from {file_name}")
                 
-                valid_ids = df['organism_id'].notna().sum()
-                total_rows = len(df)
-                logging.info(f"Extracted {valid_ids}/{total_rows} organism IDs from {file_name}")
+                if df.empty:
+                    logging.warning(f"Skipping empty sheet '{sheet_name}' in {file_name}")
+                    continue
+                
+                df['sample_id'] = sample_id
+                
+                if 'organism_name' in df.columns:
+                    df['organism_id'] = df['organism_name'].str.extract(r'^(GC[AF]_\d+\.\d+)', expand=False)
+                    
+                    valid_ids = df['organism_id'].notna().sum()
+                    total_rows = len(df)
+                    logging.info(f"Extracted {valid_ids}/{total_rows} organism IDs from sheet '{sheet_name}' in {file_name}")
+                
+                df['tax_id'] = -1
+                
+                numeric_columns = [
+                    'num_unique_kmers_in_genome_sketch', 'num_total_kmers_in_genome_sketch',
+                    'scale_factor', 'num_exclusive_kmers_in_sample_sketch', 'num_total_kmers_in_sample_sketch',
+                    'min_coverage', 'p_vals', 'num_exclusive_kmers_to_genome',
+                    'num_exclusive_kmers_to_genome_coverage', 'num_matches', 'acceptance_threshold_with_coverage',
+                    'actual_confidence_with_coverage', 'alt_confidence_mut_rate_with_coverage'
+                ]
+                
+                if 'num_exclusive_kmers_to_genоме_coverage' in df.columns:
+                    df = df.rename(columns={'num_exclusive_kmers_to_genоме_coverage': 'num_exclusive_kmers_to_genome_coverage'})
+                    logging.warning(f"Fixed column name typo in sheet '{sheet_name}' of {file_name}: genоме -> genome")
+                
+                for col in [c for c in numeric_columns if c in df.columns]:
+                    if df[col].dtype == 'object':
+                        try:
+                            df[col] = df[col].astype(str).str.replace(',', '.').replace('', 'NaN').fillna(pd.NA)
+                            
+                            df[col] = pd.to_numeric(df[col], errors='coerce')
+                            
+                            # Additional cleaning for problematic values
+                            df[col] = df[col].replace([float('inf'), float('-inf')], None)
+                            df[col] = df[col].fillna(0.0)
+                            
+                        except Exception as e:
+                            logging.warning(f"Could not convert column {col} in sheet '{sheet_name}': {str(e)}")
+                            df[col] = 0.0  # Set default value if conversion fails
+                
+                expected_columns = [
+                    'sample_id', 'organism_name', 'organism_id', 'tax_id', 'num_unique_kmers_in_genome_sketch',
+                    'num_total_kmers_in_genome_sketch', 'scale_factor', 'num_exclusive_kmers_in_sample_sketch',
+                    'num_total_kmers_in_sample_sketch', 'min_coverage', 'p_vals', 'num_exclusive_kmers_to_genome',
+                    'num_exclusive_kmers_to_genome_coverage', 'num_matches', 'acceptance_threshold_with_coverage',
+                    'actual_confidence_with_coverage', 'alt_confidence_mut_rate_with_coverage', 'in_sample_est'
+                ]
+                
+                for col in expected_columns:
+                    if col not in df.columns:
+                        if col == 'sample_id':
+                            df[col] = sample_id
+                        elif col == 'organism_id':
+                            df[col] = None
+                        elif col == 'tax_id':
+                            df[col] = -1
+                        elif col == 'in_sample_est':
+                            df[col] = False
+                        elif col.startswith('num_') or col in ['scale_factor', 'min_coverage', 'p_vals']:
+                            df[col] = 0.0
+                        else:
+                            df[col] = None
+                        logging.warning(f"Added missing column '{col}' with default value in sheet '{sheet_name}' of {file_name}")
+                
+                # Ensure in_sample_est is properly converted to boolean
+                if 'in_sample_est' in df.columns:
+                    df['in_sample_est'] = df['in_sample_est'].fillna(False)
+                    if df['in_sample_est'].dtype == 'object':
+                        df['in_sample_est'] = df['in_sample_est'].astype(str).str.lower().isin(['true', '1', 'yes', 'y'])
+                    df['in_sample_est'] = df['in_sample_est'].astype(bool)
+                
+                df_selected = df[expected_columns].copy()
+                
+                if len(df_selected.columns) != 18:
+                    logging.error(f"Column count mismatch in sheet '{sheet_name}' of {file_name}: expected 18, got {len(df_selected.columns)}")
+                    logging.error(f"Columns: {list(df_selected.columns)}")
+                    continue
+                
+                file_dataframes.append(df_selected)
+                logging.info(f"Successfully processed sheet '{sheet_name}' from {file_name}: {len(df_selected)} records, {len(df_selected.columns)} columns")
             
-            df['tax_id'] = -1
-            
-            if 'in_sample_est' in df.columns:
-                df['in_sample_est'] = df['in_sample_est'].replace({'ИСТИНА': True, 'ЛОЖЬ': False})
-            
-            numeric_columns = [
-                'num_unique_kmers_in_genome_sketch', 'num_total_kmers_in_genome_sketch',
-                'scale_factor', 'num_exclusive_kmers_in_sample_sketch', 'num_total_kmers_in_sample_sketch',
-                'min_coverage', 'p_vals', 'num_exclusive_kmers_to_genome',
-                'num_exclusive_kmers_to_genome_coverage', 'num_matches', 'acceptance_threshold_with_coverage',
-                'actual_confidence_with_coverage', 'alt_confidence_mut_rate_with_coverage'
-            ]
-            
-            if 'num_exclusive_kmers_to_genоме_coverage' in df.columns:
-                df = df.rename(columns={'num_exclusive_kmers_to_genоме_coverage': 'num_exclusive_kmers_to_genome_coverage'})
-                logging.warning(f"Fixed column name typo in {file_name}: genоме -> genome")
-            
-            for col in [c for c in numeric_columns if c in df.columns]:
-                if df[col].dtype == 'object':
-                    try:
-                        df[col] = df[col].astype(str).str.replace(',', '.').replace('', 'NaN').fillna(pd.NA)
-                        
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
-                    except Exception as e:
-                        logging.warning(f"Could not convert column {col}: {str(e)}")
-            
-            expected_columns = [
-                'sample_id', 'organism_name', 'organism_id', 'tax_id', 'num_unique_kmers_in_genome_sketch',
-                'num_total_kmers_in_genome_sketch', 'scale_factor', 'num_exclusive_kmers_in_sample_sketch',
-                'num_total_kmers_in_sample_sketch', 'min_coverage', 'p_vals', 'num_exclusive_kmers_to_genome',
-                'num_exclusive_kmers_to_genome_coverage', 'num_matches', 'acceptance_threshold_with_coverage',
-                'actual_confidence_with_coverage', 'alt_confidence_mut_rate_with_coverage', 'in_sample_est'
-            ]
-            
-            for col in expected_columns:
-                if col not in df.columns:
-                    if col == 'sample_id':
-                        df[col] = sample_id
-                    elif col == 'organism_id':
-                        df[col] = None
-                    elif col == 'tax_id':
-                        df[col] = -1
-                    elif col == 'in_sample_est':
-                        df[col] = False
-                    elif col.startswith('num_') or col in ['scale_factor', 'min_coverage', 'p_vals']:
-                        df[col] = 0.0
-                    else:
-                        df[col] = None
-                    logging.warning(f"Added missing column '{col}' with default value in {file_name}")
-            
-            df_selected = df[expected_columns].copy()
-            
-            if len(df_selected.columns) != 18:
-                logging.error(f"Column count mismatch in {file_name}: expected 18, got {len(df_selected.columns)}")
-                logging.error(f"Columns: {list(df_selected.columns)}")
-                continue
-            
-            all_data.append(df_selected)
-            logging.info(f"Successfully processed {file_name}: {len(df_selected)} records, {len(df_selected.columns)} columns")
-            
+            # Combine all sheets from this file
+            if file_dataframes:
+                file_combined_df = pd.concat(file_dataframes, ignore_index=True)
+                all_data.append(file_combined_df)
+                logging.info(f"Combined {len(file_dataframes)} sheets from {file_name}: total {len(file_combined_df)} records")
+            else:
+                logging.warning(f"No valid sheets found in {file_name}")
+                
         except Exception as e:
             logging.error(f"Error processing {file_path}: {str(e)}", exc_info=True)
     
     if all_data:
         logging.info(f"Inserting data from {len(all_data)} files...")
         combined_df = pd.concat(all_data, ignore_index=True)
+        
+        # Clean up data before inserting to prevent DuckDB internal errors
+        logging.info("Cleaning data before database insertion...")
+        
+        # Handle NaN values in numeric columns
+        numeric_columns = [
+            'num_unique_kmers_in_genome_sketch', 'num_total_kmers_in_genome_sketch',
+            'scale_factor', 'num_exclusive_kmers_in_sample_sketch', 'num_total_kmers_in_sample_sketch',
+            'min_coverage', 'p_vals', 'num_exclusive_kmers_to_genome',
+            'num_exclusive_kmers_to_genome_coverage', 'num_matches', 'acceptance_threshold_with_coverage',
+            'actual_confidence_with_coverage', 'alt_confidence_mut_rate_with_coverage'
+        ]
+        
+        for col in numeric_columns:
+            if col in combined_df.columns:
+                try:
+                    # Replace inf and -inf with NaN, then fill with 0
+                    combined_df[col] = combined_df[col].replace([float('inf'), float('-inf')], None)
+                    combined_df[col] = pd.to_numeric(combined_df[col], errors='coerce').fillna(0.0)
+                    
+                    # Additional check for string representations
+                    if combined_df[col].dtype == 'object':
+                        combined_df[col] = combined_df[col].astype(str)
+                        combined_df[col] = combined_df[col].replace(['inf', '-inf', 'Infinity', '-Infinity', 'NaN', 'nan'], '0.0')
+                        combined_df[col] = pd.to_numeric(combined_df[col], errors='coerce').fillna(0.0)
+                        
+                except Exception as e:
+                    logging.warning(f"Error cleaning column {col}: {str(e)}, setting to 0.0")
+                    combined_df[col] = 0.0
+        
+        # Ensure tax_id is properly set
+        combined_df['tax_id'] = combined_df['tax_id'].fillna(-1).astype(int)
+        
+        # Clean string columns
+        string_columns = ['sample_id', 'organism_name', 'organism_id']
+        for col in string_columns:
+            if col in combined_df.columns:
+                combined_df[col] = combined_df[col].astype(str).replace('nan', None)
+        
+        # Ensure boolean column is properly typed
+        combined_df['in_sample_est'] = combined_df['in_sample_est'].fillna(False).astype(bool)
         
         conn.execute("DELETE FROM taxa_profiles.profiles")
         
@@ -684,13 +793,36 @@ def process_taxa_profiles(taxa_profiles_dir, db_path="functional_profile.db"):
             raise
     
     try:
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_taxa_profiles_sample_id ON taxa_profiles.profiles (sample_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_taxa_profiles_organism_id ON taxa_profiles.profiles (organism_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_taxa_profiles_organism_name ON taxa_profiles.profiles (organism_name)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_taxa_profiles_confidence ON taxa_profiles.profiles (actual_confidence_with_coverage)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_taxa_profiles_tax_id ON taxa_profiles.profiles (tax_id)")
+        logging.info("Creating indexes for taxa_profiles...")
+        
+        # Check if data exists before creating indexes
+        count_result = conn.execute("SELECT COUNT(*) FROM taxa_profiles.profiles").fetchone()
+        if count_result and count_result[0] > 0:
+            logging.info(f"Creating indexes for {count_result[0]} records...")
+            
+            # Create indexes one by one with individual error handling
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_taxa_profiles_sample_id ON taxa_profiles.profiles (sample_id)")
+                logging.info("Created index on sample_id")
+            except Exception as e:
+                logging.warning(f"Could not create index on sample_id: {str(e)}")
+            
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_taxa_profiles_organism_id ON taxa_profiles.profiles (organism_id)")
+                logging.info("Created index on organism_id")
+            except Exception as e:
+                logging.warning(f"Could not create index on organism_id: {str(e)}")
+            
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_taxa_profiles_organism_name ON taxa_profiles.profiles (organism_name)")
+                logging.info("Created index on organism_name")
+            except Exception as e:
+                logging.warning(f"Could not create index on organism_name: {str(e)}")
+        else:
+            logging.warning("No data found in taxa_profiles.profiles, skipping index creation")
+            
     except Exception as e:
-        logging.warning(f"Could not create indexes: {str(e)}")
+        logging.warning(f"Error during index creation: {str(e)}")
     
     conn.close()
 
@@ -920,6 +1052,12 @@ def process_taxonomy_mapping(data_dir, db_path="functional_profile.db"):
         for genome_id, taxid, source_file, organism_name in examples:
             print(f"   {genome_id} → {taxid} (from {source_file})")
             print(f"      Organism: {organism_name[:80]}...")
+            
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_taxa_profiles_tax_id ON taxa_profiles.profiles (tax_id)")
+        logging.info("Created index on tax_id")
+    except Exception as e:
+        logging.warning(f"Could not create index on tax_id: {str(e)}")
     
     conn.execute("DROP TABLE temp_taxonomy_mapping")
     conn.close()
@@ -953,6 +1091,8 @@ def process_geographical_location_data(data_dir, db_path="functional_profile.db"
     geo_files.extend(glob.glob(os.path.join(data_dir, "*geo_location*.csv")))
     geo_files.extend(glob.glob(os.path.join(data_dir, "*biosample_geographical*.csv")))
     geo_files.extend(glob.glob(os.path.join(data_dir, "output.csv")))
+    
+    geo_files = list(dict.fromkeys(geo_files))
     
     if not geo_files:
         logging.warning("No geographical location CSV files found. Skipping geographical data processing.")
@@ -1128,10 +1268,6 @@ def main():
     max_workers = args.workers if args.workers else Config.MAX_WORKERS
     batch_size = args.batch_size if args.batch_size else Config.BATCH_SIZE
     
-    signature_processing = not args.no_signatures and Config.SIGNATURE_PROCESSING_ENABLED
-    taxa_processing = not args.no_taxa and Config.TAXA_PROCESSING_ENABLED
-    gather_processing = not args.no_gather and Config.GATHER_PROCESSING_ENABLED
-    
     progress_enabled = not args.no_progress and Config.PROGRESS_BAR_ENABLED
     continue_on_error = args.continue_on_error or Config.CONTINUE_ON_ERROR
     
@@ -1142,9 +1278,6 @@ def main():
     print(f"🗄️ Database path: {db_path}")
     print(f"⚙️ Max workers: {max_workers}")
     print(f"📦 Batch size: {batch_size}")
-    print(f"🧬 Signature processing: {'Enabled' if signature_processing else 'Disabled'}")
-    print(f"🦠 Taxa processing: {'Enabled' if taxa_processing else 'Disabled'}")
-    print(f"🔍 Gather processing: {'Enabled' if gather_processing else 'Disabled'}")
     print(f"📊 Progress bars: {'Enabled' if progress_enabled else 'Disabled'}")
     print(f"🔄 Continue on error: {'Yes' if continue_on_error else 'No'}")
     
@@ -1168,22 +1301,19 @@ def main():
             logging.info("Processing functional profiles...")
             process_functional_profiles(func_profiles_dir, db_path)
             
-            if gather_processing:
-                logging.info("Processing gather files...")
-                process_gather_files(func_profiles_dir, db_path)
+            logging.info("Processing gather files...")
+            process_gather_files(func_profiles_dir, db_path)
             
-            if taxa_processing:
-                logging.info("Processing taxa profiles...")
-                process_taxa_profiles(taxa_profiles_dir, db_path)
+            logging.info("Processing taxa profiles...")
+            process_taxa_profiles(taxa_profiles_dir, db_path)
             
-            if signature_processing:
-                logging.info("Processing protein signatures...")
-                process_signature_files(sigs_aa_dir, "sigs_aa", db_path=db_path, 
-                                      batch_size=batch_size, max_workers=max_workers)
-                
-                logging.info("Processing DNA signatures...")
-                process_signature_files(sigs_dna_dir, "sigs_dna", db_path=db_path,
-                                      batch_size=batch_size, max_workers=max_workers)
+            logging.info("Processing protein signatures...")
+            process_signature_files(sigs_aa_dir, "sigs_aa", db_path=db_path, 
+                                  batch_size=batch_size, max_workers=max_workers)
+            
+            logging.info("Processing DNA signatures...")
+            process_signature_files(sigs_dna_dir, "sigs_dna", db_path=db_path,
+                                  batch_size=batch_size, max_workers=max_workers)
             
             if Config.CLEANUP_TEMP_FILES:
                 logging.info("Cleaning up temporary files...")
@@ -1196,9 +1326,8 @@ def main():
             else:
                 raise
     
-    if taxa_processing:
-        print("🔬 Processing taxonomy mapping...")
-        process_taxonomy_mapping(data_dir, db_path)
+    print("🔬 Processing taxonomy mapping...")
+    process_taxonomy_mapping(data_dir, db_path)
     
     print("🌍 Processing geographical location data...")
     process_geographical_location_data(data_dir, db_path)
@@ -1208,9 +1337,8 @@ def main():
     logging.info("- Schema functional_profile_data (contains gather data)")
     logging.info("- Schema taxa_profiles (contains taxa profile tables with taxonomy IDs)")
     logging.info("- Schema geographical_location_data (contains geographical location data)")
-    if signature_processing:
-        logging.info("- Schema sigs_aa (contains protein signatures)")
-        logging.info("- Schema sigs_dna (contains DNA signatures)")
+    logging.info("- Schema sigs_aa (contains protein signatures)")
+    logging.info("- Schema sigs_dna (contains DNA signatures)")
 
 if __name__ == "__main__":
     main()
