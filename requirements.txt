@@ -3,6 +3,7 @@ pandas~=2.3.1
 tqdm~=4.67.1
 vanna[chromadb, openai]
 openai
+openpyxl
 
 # Testing dependencies
 pytest>=7.0.0
