@@ -76,7 +76,7 @@ def get_sample_queries():
     print("📝 Loading sample queries for AI training...")
     
     sample_queries = {
-        "How many samples are in the database": """
+        "How many functional profiles are in the database": """
             SELECT COUNT(DISTINCT sample_id) as total_samples
             FROM functional_profile.profiles
         """,
@@ -104,7 +104,7 @@ def get_sample_queries():
         "Find functional diversity (number of KO functions) for sample DRR012573": """
             SELECT 
                 sample_id,
-                COUNT(DISTINCT ko_id) as ko_diversity,
+                COUNT(DISTINCT ko_id) as number_kos,
                 SUM(abundance) as total_abundance,
                 AVG(abundance) as avg_abundance
             FROM functional_profile.profiles
@@ -130,7 +130,7 @@ def get_sample_queries():
             LIMIT 10
         """,
         
-        "Compare functional diversity between samples DRR012573 and DRR012574": """
+        "Compare the count, total abundance, and average abundance of KOs between samples DRR012573 and DRR012574": """
             SELECT 
                 sample_id,
                 COUNT(DISTINCT ko_id) as ko_diversity,
@@ -142,7 +142,7 @@ def get_sample_queries():
             ORDER BY ko_diversity DESC
         """,
         
-        "Find samples containing specific KO function": """
+        "Return all functional profiles ordered by abundance": """
             SELECT 
                 sample_id,
                 ko_id,
@@ -151,7 +151,7 @@ def get_sample_queries():
             ORDER BY abundance DESC
         """,
         
-        "Get functional profile statistics per sample": """
+        "Get functional profile statistics per sample for the top 20 samples with the most KOs": """
             SELECT 
                 sample_id,
                 COUNT(DISTINCT ko_id) as unique_ko_functions,
@@ -165,7 +165,7 @@ def get_sample_queries():
             LIMIT 20
         """,
         
-        "Find most abundant KO functions across all samples": """
+        "Find the top 20 (in terms of total abunance) KOs that appear in more than 5 samples": """
             SELECT 
                 ko_id,
                 COUNT(DISTINCT sample_id) as present_in_samples,
