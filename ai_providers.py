@@ -263,9 +263,9 @@ class OllamaProvider(BaseProvider):
                         import duckdb
 
                         if url.startswith("motherduck:"):
-                            self.db = duckdb.connect(url)
+                            self.db = duckdb.connect(url, read_only=True)
                         else:
-                            self.db = duckdb.connect(url)
+                            self.db = duckdb.connect(url, read_only=True)
 
                         self.db_type = "duckdb"
 
