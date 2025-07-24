@@ -144,7 +144,8 @@ def process_signature_files(archive_dir, sig_type, db_path=None, batch_size=None
             md5 VARCHAR,
             min_hash BIGINT,
             abundance INTEGER,
-            position INTEGER
+            position INTEGER,
+            ksize INTEGER
         )
     """)
     
@@ -255,7 +256,8 @@ def process_signature_files(archive_dir, sig_type, db_path=None, batch_size=None
                                                 'md5': md5,
                                                 'min_hash': min_hash,
                                                 'abundance': abundance,
-                                                'position': i
+                                                'position': i,
+                                                'ksize': ksize
                                             })
                                     else:
                                         for i, min_hash in enumerate(mins):
@@ -264,7 +266,8 @@ def process_signature_files(archive_dir, sig_type, db_path=None, batch_size=None
                                                 'md5': md5,
                                                 'min_hash': min_hash,
                                                 'abundance': 1,
-                                                'position': i
+                                                'position': i,
+                                                'ksize': ksize
                                             })
                                 
                             except json.JSONDecodeError as e:
