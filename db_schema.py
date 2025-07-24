@@ -193,7 +193,7 @@ def get_sample_queries():
             LIMIT 20
         """,
         
-        "Show sequence similarity statistics": """
+        "Show the average fraction of the query that matched, the average max containment, and the average containment ANI in all the functiona profile data": """
             SELECT 
                 COUNT(DISTINCT sample_id) as num_samples,
                 COUNT(*) as total_matches,
