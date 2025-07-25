@@ -41,18 +41,32 @@ def record_failure(path: str, err: Exception | str):
     FAILED_FILES.append((path, str(err)))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ②  DUCKDB SAFE EXECUTION WRAPPER
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
+# ②  DUCKDB SAFE EXECUTION WRAPPER  (drop‑in replacement)
+# ------------------------------------------------------------------
+def _db_path(conn: duckdb.DuckDBPyConnection) -> str:
+    """
+    Return the filename behind *conn*.
+
+    • DuckDB ≤1.2  : attribute .database exists – use it.
+    • DuckDB ≥1.3  : fall back to PRAGMA database_list.
+    """
+    try:
+        return conn.database                       # old API
+    except AttributeError:
+        return conn.execute("PRAGMA database_list").fetchone()[1] or ':memory:'
+
+
 def safe_execute(conn: duckdb.DuckDBPyConnection,
                  sql: str,
                  df: pd.DataFrame | None = None,
                  file_ctx: str | None = None):
     """
-    Execute a DuckDB SQL statement inside its own transaction.
-    If DuckDB throws a *fatal* InternalException that aborts the connection,
-    we reopen a fresh connection and try once more.  If it still fails we
-    record the offending file (if provided) and carry on.
+    Execute *sql* (optionally against *df*) with automatic retry.
+
+    If DuckDB throws an InternalException we reopen a fresh connection
+    to the same file path (_db_path(conn)).  When that still fails the
+    file is recorded and processing continues.
     """
     try:
         conn.execute("BEGIN")
@@ -63,16 +77,16 @@ def safe_execute(conn: duckdb.DuckDBPyConnection,
         else:
             conn.execute(sql)
         conn.commit()
-        return
-    except Exception as e1:            # includes duckdb.InternalException
+        return                                # success on first try
+    except Exception:
         try:
             conn.rollback()
         except Exception:
             pass
-        # try again with a *new* connection (duckdb is sometimes left in an
-        # unusable state after InternalException)
+
+        # retry once with a clean connection
         try:
-            fresh = duckdb.connect(conn.database)
+            fresh = duckdb.connect(_db_path(conn))
             if df is not None:
                 fresh.register("tmp_df", df)
                 fresh.execute(sql.replace(" df", " tmp_df"))
@@ -80,17 +94,18 @@ def safe_execute(conn: duckdb.DuckDBPyConnection,
             else:
                 fresh.execute(sql)
             fresh.close()
-            return                    # second try succeeded
+            return                            # retry succeeded
         except Exception as e2:
             if file_ctx:
                 record_failure(file_ctx, e2)
             else:
-                logging.error(f"DuckDB fatal error w/o file context: {e2}")
+                logging.error(f"DuckDB fatal error without file context: {e2}")
         finally:
             try:
                 fresh.close()
             except Exception:
                 pass
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
