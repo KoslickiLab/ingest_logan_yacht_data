@@ -54,7 +54,7 @@ def _db_path(conn: duckdb.DuckDBPyConnection) -> str:
     try:
         return conn.database                       # old API
     except AttributeError:
-        return conn.execute("PRAGMA database_list").fetchone()[1] or ':memory:'
+        return conn.execute("PRAGMA database_list").fetchone()[2] or ':memory:'
 
 
 def safe_execute(conn: duckdb.DuckDBPyConnection,
