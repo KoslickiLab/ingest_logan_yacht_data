@@ -1095,62 +1095,81 @@ def process_geographical_location_data(data_dir, db_path="functional_profile.db"
                 'biome', 'confidence', 'sample_id'
             ]
 
-            if file_size_mb > 100:
-                chunk_size = 10000
-                logging.info(f"Large file detected, using chunked reading with chunk size {chunk_size}")
-            elif file_size_mb > 50:
-                chunk_size = 25000
+            # larger chunks = far fewer Python↔DuckDB crossings
+            if file_size_mb > 500:
+                chunk_size = 1_000_000  # ~150–200 MB RAM
+            elif file_size_mb > 100:
+                chunk_size = 250_000
             else:
-                chunk_size = 50000
+                chunk_size = 100_000
+            logging.info(f"Using chunk size {chunk_size}")
 
             file_chunk_count = 0
             file_total_records = 0
 
             try:
+                # ───────────────────────────────────────────────────────────
+                # FAST BULK‑LOADER
+                #   • Arrow engine for faster CSV decode
+                #   • buffer to 250 k rows (~40 MB) before each INSERT
+                #   • single BEGIN/COMMIT per file
+                # ───────────────────────────────────────────────────────────
+                engine = "pyarrow" if pd.__version__ >= "2" else "c"
+                buffer, buffered_rows, commit_threshold = [], 0, 250_000
+
+                conn.execute("BEGIN")
                 chunk_reader = pd.read_csv(
                     file_path,
                     chunksize=chunk_size,
                     dtype=str,
                     na_filter=False,
-                    keep_default_na=False
+                    keep_default_na=False,
+                    engine=engine,
                 )
 
                 for chunk_df in tqdm(chunk_reader, desc=f"Reading {file_name}", leave=False):
-                    file_chunk_count += 1
-
                     if chunk_df.empty:
-                        logging.warning(f"Skipping empty chunk {file_chunk_count} in {file_name}")
                         continue
 
-                    for col in expected_columns:
-                        if col not in chunk_df.columns:
-                            chunk_df[col] = None
-                            if file_chunk_count == 1:
-                                logging.warning(f"Added missing column '{col}' with NULL values in {file_name}")
+                    # guarantee all expected columns exist and are ordered
+                    chunk_df = (
+                        chunk_df.reindex(columns=expected_columns, fill_value=None)
+                        .replace({'nan': None, 'NaN': None, 'NULL': None,
+                                  'null': None, '': None})
+                    )
 
-                    chunk_df_selected = chunk_df[expected_columns].copy()
+                    buffer.append(chunk_df)
+                    buffered_rows += len(chunk_df)
 
-                    for col in chunk_df_selected.columns:
-                        chunk_df_selected[col] = chunk_df_selected[col].replace({
-                            'nan': None, 'NaN': None, 'NULL': None, 'null': None, '': None
-                        })
+                    if buffered_rows >= commit_threshold:
+                        df_bulk = pd.concat(buffer, ignore_index=True)
+                        conn.register("df_geo", df_bulk)
+                        conn.execute("""
+                                     INSERT INTO geographical_location_data.locations
+                                     SELECT *
+                                     FROM df_geo
+                                     """)
+                        conn.unregister("df_geo")
+                        buffer.clear()
+                        buffered_rows = 0
 
-                    try:
-                        conn.execute("INSERT INTO geographical_location_data.locations SELECT * FROM chunk_df_selected")
-                        chunk_records = len(chunk_df_selected)
-                        file_total_records += chunk_records
+                # flush remaining rows
+                if buffer:
+                    df_bulk = pd.concat(buffer, ignore_index=True)
+                    conn.register("df_geo", df_bulk)
+                    conn.execute("""
+                                 INSERT INTO geographical_location_data.locations
+                                 SELECT *
+                                 FROM df_geo
+                                 """)
+                    conn.unregister("df_geo")
 
-                        if file_chunk_count % 10 == 0:
-                            logging.info(
-                                f"Processed {file_chunk_count} chunks from {file_name}, {file_total_records} records so far")
-
-                    except Exception as e:
-                        logging.error(f"Error inserting chunk {file_chunk_count} from {file_name}: {str(e)}")
-                        continue
-
+                conn.execute("COMMIT")
+                file_total_records += buffered_rows
                 total_records += file_total_records
                 logging.info(
-                    f"Successfully processed {file_name}: {file_total_records} records in {file_chunk_count} chunks")
+                    f"Successfully processed {file_name}: {file_total_records} records")
+
 
             except pd.errors.EmptyDataError:
                 logging.warning(f"File {file_name} is empty, skipping")
