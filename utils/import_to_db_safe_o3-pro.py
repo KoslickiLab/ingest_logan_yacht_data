@@ -2,9 +2,9 @@
 """
 Resilient Logan data‑ingest script.
 
-Only three things are new compared to the original                ─────────────
+Only three things are new compared to the original─────────────
 1. FAILED_FILES / record_failure()
-2. safe_execute()   – wraps any DuckDB statement in a try/except/reconnect
+2. safe_execute()– wraps any DuckDB statement in a try/except/reconnect
 3. Every per‑source‑file INSERT now uses safe_execute()
 
 Everything else – the CLI, argument names, table layouts, indexes,
@@ -23,6 +23,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import duckdb, pandas as pd
 from tqdm import tqdm
 import logging
+
+# ─── GLOBAL FLAGS ─────────────────────────────────────────────
+NEED_IDX_TAXA = False     # taxa_profiles.profiles
+NEED_IDX_FUNC = False     # functional_profile.profiles
+NEED_IDX_SIG_AA = False   # sigs_aa.* tables
+NEED_IDX_SIG_DNA = False  # sigs_dna.* tables
 
 # keep project‑local imports exactly as before
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -106,14 +112,6 @@ def safe_execute(conn: duckdb.DuckDBPyConnection,
             except Exception:
                 pass
 
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# The rest of the original script starts here – nothing has been *removed*.
-# Whenever the code used to do `conn.execute("INSERT … df")` that operation is
-# replaced by `safe_execute(conn, "INSERT … df", df, <file_path>)`.
-# All other statements are 100 % identical.
-# ──────────────────────────────────────────────────────────────────────────────
 
 def parse_processing_args():  # unchanged
     parser = argparse.ArgumentParser(
@@ -226,14 +224,18 @@ def process_taxa_profiles(taxa_profiles_dir, db_path="functional_profile.db"):
                      file_ctx=file_path)
         # --------------------------------------------------------------------
 
-    # original index creation logic remains unchanged
-    try:
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_taxa_profiles_sample_id ON taxa_profiles.profiles (sample_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_taxa_profiles_organism_id ON taxa_profiles.profiles (organism_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_taxa_profiles_organism_name ON taxa_profiles.profiles (organism_name)")
-    except Exception as e:
-        logging.warning(f"Could not create indexes: {e}")
+    # index creation
+    #try:
+    #    conn.execute("CREATE INDEX IF NOT EXISTS idx_taxa_profiles_sample_id ON taxa_profiles.profiles (sample_id)")
+    #    conn.execute("CREATE INDEX IF NOT EXISTS idx_taxa_profiles_organism_id ON taxa_profiles.profiles (organism_id)")
+    #    conn.execute("CREATE INDEX IF NOT EXISTS idx_taxa_profiles_organism_name ON taxa_profiles.profiles (organism_name)")
+    #except Exception as e:
+    #    logging.warning(f"Could not create indexes: {e}")
+    # defer index creation – build once after all archives are processed
+    global NEED_IDX_TAXA
+    NEED_IDX_TAXA = True
     conn.close()
+    return
 
 
 def extract_nested_archives(archive_path):
@@ -343,14 +345,18 @@ def process_functional_profiles(func_profiles_dir, db_path="functional_profile.d
 
         logging.info(f"Inserted {len(combined_df)} functional profile records")
 
-    try:
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_functional_profile_sample_id ON functional_profile.profiles (sample_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_functional_profile_ko_id ON functional_profile.profiles (ko_id)")
-    except Exception as e:
-        logging.warning(f"Could not create indexes: {str(e)}")
-
+    #try:
+    #    conn.execute(
+    #        "CREATE INDEX IF NOT EXISTS idx_functional_profile_sample_id ON functional_profile.profiles (sample_id)")
+    #    conn.execute("CREATE INDEX IF NOT EXISTS idx_functional_profile_ko_id ON functional_profile.profiles (ko_id)")
+    #except Exception as e:
+    #    logging.warning(f"Could not create indexes: {str(e)}")
+    #conn.close()
+    # defer index creation
+    global NEED_IDX_FUNC
+    NEED_IDX_FUNC = True
     conn.close()
+    return
 
 
 def process_signature_files(archive_dir, sig_type, db_path=None, batch_size=None, max_workers=None):
@@ -667,23 +673,30 @@ def process_signature_files(archive_dir, sig_type, db_path=None, batch_size=None
                         except Exception as row_error:
                             logging.error(f"Problem row: {row.to_dict()}, Error: {row_error}")
                     logging.info(f"Inserted {success_count}/{len(df_mins)} rows individually")
-
-    logging.info(f"Creating indexes for {schema_name}...")
-    try:
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{schema_name}_manifests_sample_id ON {schema_name}.manifests (sample_id)")
-        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{schema_name}_manifests_md5 ON {schema_name}.manifests (md5)")
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{schema_name}_signatures_sample_id ON {schema_name}.signatures (sample_id)")
-        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{schema_name}_signatures_md5 ON {schema_name}.signatures (md5)")
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{schema_name}_signature_mins_sample_id ON {schema_name}.signature_mins (sample_id)")
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{schema_name}_signature_mins_md5 ON {schema_name}.signature_mins (md5)")
-    except Exception as e:
-        logging.warning(f"Could not create indexes: {str(e)}")
-
+    # Index creation #TODO: This code location is suspect
+    global NEED_IDX_SIG_AA, NEED_IDX_SIG_DNA
+    if sig_type == "sigs_aa":
+        NEED_IDX_SIG_AA = True
+    else:
+        NEED_IDX_SIG_DNA = True
     conn.close()
+    return
+
+    #logging.info(f"Creating indexes for {schema_name}...")
+    #try:
+    #    conn.execute(
+    #        f"CREATE INDEX IF NOT EXISTS idx_{schema_name}_manifests_sample_id ON {schema_name}.manifests (sample_id)")
+    #    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{schema_name}_manifests_md5 ON {schema_name}.manifests (md5)")
+    #    conn.execute(
+    #        f"CREATE INDEX IF NOT EXISTS idx_{schema_name}_signatures_sample_id ON {schema_name}.signatures (sample_id)")
+    #    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{schema_name}_signatures_md5 ON {schema_name}.signatures (md5)")
+    #    conn.execute(
+    #        f"CREATE INDEX IF NOT EXISTS idx_{schema_name}_signature_mins_sample_id ON {schema_name}.signature_mins (sample_id)")
+    #    conn.execute(
+    #        f"CREATE INDEX IF NOT EXISTS idx_{schema_name}_signature_mins_md5 ON {schema_name}.signature_mins (md5)")
+    #except Exception as e:
+    #    logging.warning(f"Could not create indexes: {str(e)}")
+    #conn.close()
 
 
 def process_gather_files(func_profiles_dir, db_path="functional_profile.db"):
@@ -1231,6 +1244,92 @@ def process_geographical_location_data(data_dir, db_path="functional_profile.db"
     conn.close()
 
 
+# ────────────────────────────────────────────────────────────────
+# Build all postponed ART indexes in one shot
+# ────────────────────────────────────────────────────────────────
+def build_deferred_indexes(db_path: str):
+    conn = duckdb.connect(db_path)
+    try:
+        if NEED_IDX_TAXA:
+            logging.info("⏳ Building indexes on taxa_profiles.profiles …")
+            conn.execute("""
+                CREATE INDEX idx_taxa_profiles_sample_id
+                       ON taxa_profiles.profiles (sample_id)
+            """)
+            conn.execute("""
+                CREATE INDEX idx_taxa_profiles_organism_id
+                       ON taxa_profiles.profiles (organism_id)
+            """)
+            conn.execute("""
+                CREATE INDEX idx_taxa_profiles_organism_name
+                       ON taxa_profiles.profiles (organism_name)
+            """)
+        if NEED_IDX_FUNC:
+            logging.info("⏳ Building indexes on functional_profile.profiles …")
+            conn.execute("""
+                CREATE INDEX idx_functional_profile_sample_id
+                       ON functional_profile.profiles (sample_id)
+            """)
+            conn.execute("""
+                CREATE INDEX idx_functional_profile_ko_id
+                       ON functional_profile.profiles (ko_id)
+            """)
+        if NEED_IDX_SIG_AA:
+            logging.info("⏳ Building indexes on sigs_aa tables …")
+            conn.execute("""
+                CREATE INDEX idx_sigs_aa_manifests_sample_id
+                       ON sigs_aa.manifests (sample_id)
+            """)
+            conn.execute("""
+                CREATE INDEX idx_sigs_aa_manifests_md5
+                       ON sigs_aa.manifests (md5)
+            """)
+            conn.execute("""
+                CREATE INDEX idx_sigs_aa_signatures_sample_id
+                       ON sigs_aa.signatures (sample_id)
+            """)
+            conn.execute("""
+                CREATE INDEX idx_sigs_aa_signatures_md5
+                       ON sigs_aa.signatures (md5)
+            """)
+            conn.execute("""
+                CREATE INDEX idx_sigs_aa_signature_mins_sample_id
+                       ON sigs_aa.signature_mins (sample_id)
+            """)
+            conn.execute("""
+                CREATE INDEX idx_sigs_aa_signature_mins_md5
+                       ON sigs_aa.signature_mins (md5)
+            """)
+        if NEED_IDX_SIG_DNA:
+            logging.info("⏳ Building indexes on sigs_dna tables …")
+            conn.execute("""
+                CREATE INDEX idx_sigs_dna_manifests_sample_id
+                       ON sigs_dna.manifests (sample_id)
+            """)
+            conn.execute("""
+                CREATE INDEX idx_sigs_dna_manifests_md5
+                       ON sigs_dna.manifests (md5)
+            """)
+            conn.execute("""
+                CREATE INDEX idx_sigs_dna_signatures_sample_id
+                       ON sigs_dna.signatures (sample_id)
+            """)
+            conn.execute("""
+                CREATE INDEX idx_sigs_dna_signatures_md5
+                       ON sigs_dna.signatures (md5)
+            """)
+            conn.execute("""
+                CREATE INDEX idx_sigs_dna_signature_mins_sample_id
+                       ON sigs_dna.signature_mins (sample_id)
+            """)
+            conn.execute("""
+                CREATE INDEX idx_sigs_dna_signature_mins_md5
+                       ON sigs_dna.signature_mins (md5)
+            """)
+    finally:
+        conn.close()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # …process_functional_profiles(), process_gather_files(), process_signature_
 # … handlers were all updated in the *same* way: every INSERT goes through
@@ -1279,6 +1378,10 @@ def main():
 
     process_taxonomy_mapping(data_dir, db_path)
     process_geographical_location_data(data_dir, db_path)
+
+    # build all deferred ART indexes once loading is finished
+    build_deferred_indexes(db_path)
+
 
     # ③  FINAL FAILURE SUMMARY
     if FAILED_FILES:
