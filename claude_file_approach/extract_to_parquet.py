@@ -69,7 +69,7 @@ def get_partition_key(sample_id: str) -> str:
     if not sample_id:
         return "unknown"
     # Use first 2 chars of sample_id for partitioning
-    return sample_id[:4].lower()
+    return sample_id[:2].lower()
 
 def ensure_parquet_dir(base_dir: str, table_name: str, partition: str = None) -> Path:
     """Ensure parquet directory exists."""
@@ -199,13 +199,13 @@ def process_taxa_profiles(taxa_profiles_dir: str, output_dir: str, archive_name:
         write_to_parquet(combined_df, output_dir, 'taxa_profiles', 'partition_key')
         logging.info(f"Wrote {len(combined_df)} taxa profile records to Parquet")
 
-def process_functional_profiles(func_profiles_dir: str, output_dir: str, archive_name: str):
+def process_functional_profiles(func_profiles_dir: str, output_dir: str, archive_name: str, 
+                               batch_size: int = 1000):
     """Process functional profiles and write to Parquet."""
     profile_files = glob.glob(os.path.join(func_profiles_dir, "*_functional_profile"))
     logging.info(f"Found {len(profile_files)} functional profile files")
     
     batch_data = []
-    batch_size = 100  # Process 100 files at a time
     
     for i, file_path in enumerate(tqdm(profile_files, desc="Processing functional profiles", leave=False)):
         file_name = os.path.basename(file_path)
@@ -239,12 +239,12 @@ def process_functional_profiles(func_profiles_dir: str, output_dir: str, archive
             record_failure(file_path, e)
             continue
 
-def process_gather_files(func_profiles_dir: str, output_dir: str, archive_name: str):
+def process_gather_files(func_profiles_dir: str, output_dir: str, archive_name: str,
+                        batch_size: int = 500):
     """Process gather files and write to Parquet."""
     gather_files = glob.glob(os.path.join(func_profiles_dir, "*.unitigs.fa_gather_*.tmp"))
     
     batch_data = []
-    batch_size = 50
     
     for i, file_path in enumerate(tqdm(gather_files, desc="Processing gather files", leave=False)):
         file_name = os.path.basename(file_path)
@@ -321,7 +321,8 @@ def process_gather_files(func_profiles_dir: str, output_dir: str, archive_name: 
             record_failure(file_path, e)
 
 def process_signature_files(archive_dir: str, sig_type: str, output_dir: str, 
-                          archive_name: str, batch_size: int = 10000):
+                          archive_name: str, batch_size: int = 50000,
+                          manifest_batch_size: int = 500):
     """Process signature files and write to Parquet."""
     if not archive_dir:
         logging.warning(f"No {sig_type} directory found")
@@ -461,12 +462,12 @@ def process_signature_files(archive_dir: str, sig_type: str, output_dir: str,
                 record_failure(zip_path, e)
                 
         # Write batches when they get large
-        if len(manifest_batch) >= 100:
+        if len(manifest_batch) >= manifest_batch_size:
             combined_manifest = pd.concat(manifest_batch, ignore_index=True)
             write_to_parquet(combined_manifest, output_dir, f'{sig_type}_manifests', 'partition_key')
             manifest_batch = []
             
-        if len(signature_batch) >= 1000:
+        if len(signature_batch) >= 5000:
             sig_df = pd.DataFrame(signature_batch)
             write_to_parquet(sig_df, output_dir, f'{sig_type}_signatures', 'partition_key')
             signature_batch = []
@@ -550,6 +551,12 @@ def parse_args():
                        help='Resume from checkpoint')
     parser.add_argument('--no-cleanup', action='store_true',
                        help='Do not cleanup temporary files')
+    parser.add_argument('--func-batch-size', type=int, default=1000,
+                       help='Batch size for functional profiles (default: 1000)')
+    parser.add_argument('--gather-batch-size', type=int, default=500,
+                       help='Batch size for gather files (default: 500)')
+    parser.add_argument('--signature-batch-size', type=int, default=50000,
+                       help='Batch size for signature mins (default: 50000)')
     
     return parser.parse_args()
 
@@ -606,17 +613,21 @@ def main():
             func_dir, taxa_dir, sig_aa_dir, sig_dna_dir, temp_dir = extract_nested_archives(archive_path)
             
             # Process each data type
-            process_functional_profiles(func_dir, args.output_dir, archive_name)
+            process_functional_profiles(func_dir, args.output_dir, archive_name, 
+                                       args.func_batch_size)
             
             if not args.no_gather:
-                process_gather_files(func_dir, args.output_dir, archive_name)
+                process_gather_files(func_dir, args.output_dir, archive_name,
+                                   args.gather_batch_size)
                 
             if not args.no_taxa:
                 process_taxa_profiles(taxa_dir, args.output_dir, archive_name)
                 
             if not args.no_signatures:
-                process_signature_files(sig_aa_dir, "sigs_aa", args.output_dir, archive_name)
-                process_signature_files(sig_dna_dir, "sigs_dna", args.output_dir, archive_name)
+                process_signature_files(sig_aa_dir, "sigs_aa", args.output_dir, 
+                                      archive_name, args.signature_batch_size)
+                process_signature_files(sig_dna_dir, "sigs_dna", args.output_dir, 
+                                      archive_name, args.signature_batch_size)
             
             # Cleanup
             if not args.no_cleanup and Config.CLEANUP_TEMP_FILES:
