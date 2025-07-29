@@ -462,8 +462,8 @@ def main():
             logging.exception(f"Failed archive {a}: {e}")
 
     # one‑off files (not inside each archive)
-    #process_taxonomy_mapping(Path(args.data_dir))
-    #process_geographical_location_data(Path(args.data_dir))
+    process_taxonomy_mapping(Path(args.data_dir))
+    process_geographical_location_data(Path(args.data_dir))
 
     print(f"\n🎉  Export finished. Parquet files are in {STAGING_ROOT}")
 
