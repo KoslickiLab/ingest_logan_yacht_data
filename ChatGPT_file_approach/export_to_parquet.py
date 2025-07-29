@@ -53,8 +53,15 @@ def write_partitioned_parquet(df: pd.DataFrame, logical_path: str) -> None:
     table_dir = STAGING_ROOT / logical_path
     table_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── force all “object” columns to pandas’ nullable StringDtype ──────────
+    #    This turns any stray integers or bytes into strings *before*
+    #    PyArrow inspects the data, so type inference is deterministic.
+    for col in df.select_dtypes(include=["object"]).columns:
+        # astype("string") keeps missing values as <NA>, not the literal "nan"
+        df[col] = df[col].astype("string")
+
     out_file = table_dir / f"part-{uuid.uuid4()}.parquet"
-    table    = pa.Table.from_pandas(df, preserve_index=False)
+    table = pa.Table.from_pandas(df, preserve_index=False)
 
     pq.write_table(
         table,
