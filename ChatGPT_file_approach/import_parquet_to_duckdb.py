@@ -91,7 +91,7 @@ def main():
 
     conn = duckdb.connect(args.database)
     conn.execute(f"PRAGMA threads={args.threads}")
-    conn.execute("PRAGMA memory_limit='90%';")     # leave head‑room
+    conn.execute("PRAGMA memory_limit='2TB';")     # leave head‑room
 
     # ------------------------------------------------------------------
     ingest_table(conn, "functional_profile", "profiles",
