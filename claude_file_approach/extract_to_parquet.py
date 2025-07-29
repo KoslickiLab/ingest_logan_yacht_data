@@ -26,6 +26,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 import logging
+import numpy as np
 
 # Keep project-local imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -68,7 +69,7 @@ def get_partition_key(sample_id: str) -> str:
     if not sample_id:
         return "unknown"
     # Use first 2 chars of sample_id for partitioning
-    return sample_id[:5].lower()
+    return sample_id[:4].lower()
 
 def ensure_parquet_dir(base_dir: str, table_name: str, partition: str = None) -> Path:
     """Ensure parquet directory exists."""
@@ -152,7 +153,10 @@ def process_taxa_profiles(taxa_profiles_dir: str, output_dir: str, archive_name:
         for sheet_name, df in all_sheets.items():
             if df.empty:
                 continue
-                
+            
+            # Create a copy to avoid SettingWithCopyWarning
+            df = df.copy()
+            
             sample_id = file_name.split("_ANI_")[1].split(".xlsx")[0]
             df['sample_id'] = sample_id
             df['archive_name'] = archive_name
@@ -212,7 +216,10 @@ def process_functional_profiles(func_profiles_dir: str, output_dir: str, archive
             
             if df.empty or len(df) == 0:
                 continue
-                
+            
+            # Create a copy to avoid warnings
+            df = df.copy()
+            
             df['sample_id'] = sample_id
             df['archive_name'] = archive_name
             df['partition_key'] = get_partition_key(sample_id)
@@ -251,6 +258,52 @@ def process_gather_files(func_profiles_dir: str, output_dir: str, archive_name: 
             
             if df.empty:
                 continue
+            
+            # Create a copy to avoid warnings
+            df = df.copy()
+            
+            # Ensure all columns are the correct type
+            # Convert object columns that should be strings
+            string_columns = ['match_filename', 'match_name', 'match_md5', 
+                            'query_filename', 'query_name', 'query_md5', 'moltype']
+            for col in string_columns:
+                if col in df.columns:
+                    df[col] = df[col].astype(str)
+            
+            # Convert numeric columns
+            numeric_columns = {
+                'intersect_bp': 'int64',
+                'jaccard': 'float64',
+                'max_containment': 'float64',
+                'f_query_match': 'float64',
+                'f_match_query': 'float64',
+                'match_bp': 'int64',
+                'query_bp': 'int64',
+                'ksize': 'int64',
+                'scaled': 'int64',
+                'query_n_hashes': 'int64'
+            }
+            
+            for col, dtype in numeric_columns.items():
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                    if dtype.startswith('int'):
+                        df[col] = df[col].fillna(0).astype(dtype)
+                    else:
+                        df[col] = df[col].astype(dtype)
+            
+            # Handle boolean columns
+            boolean_columns = ['query_abundance', 'potential_false_negative']
+            for col in boolean_columns:
+                if col in df.columns:
+                    df[col] = df[col].astype(bool)
+            
+            # Handle float columns that might have NaN
+            float_columns = ['query_containment_ani', 'match_containment_ani', 
+                           'average_containment_ani', 'max_containment_ani']
+            for col in float_columns:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
                 
             df['sample_id'] = sample_id
             df['archive_name'] = archive_name
@@ -303,16 +356,31 @@ def process_signature_files(archive_dir: str, sig_type: str, output_dir: str,
                 manifest_path = os.path.join(temp_dir, "SOURMASH-MANIFEST.csv")
                 if os.path.exists(manifest_path):
                     df_manifest = pd.read_csv(manifest_path, skiprows=1)
+                    df_manifest = df_manifest.copy()  # Avoid SettingWithCopyWarning
+                    
                     df_manifest['sample_id'] = sample_id
                     df_manifest['archive_file'] = file_name
                     df_manifest['archive_name'] = archive_name
                     df_manifest['partition_key'] = partition_key
+                    
+                    # Ensure correct types for manifest
+                    if 'ksize' in df_manifest.columns:
+                        df_manifest['ksize'] = pd.to_numeric(df_manifest['ksize'], errors='coerce').fillna(0).astype('int64')
+                    if 'num' in df_manifest.columns:
+                        df_manifest['num'] = pd.to_numeric(df_manifest['num'], errors='coerce').fillna(0).astype('int64')
+                    if 'scaled' in df_manifest.columns:
+                        df_manifest['scaled'] = pd.to_numeric(df_manifest['scaled'], errors='coerce').fillna(0).astype('int64')
+                    if 'n_hashes' in df_manifest.columns:
+                        df_manifest['n_hashes'] = pd.to_numeric(df_manifest['n_hashes'], errors='coerce').fillna(0).astype('int64')
+                    if 'with_abundance' in df_manifest.columns:
+                        df_manifest['with_abundance'] = df_manifest['with_abundance'].astype(bool)
+                    
                     manifest_batch.append(df_manifest)
                     
                     # Process signature files
                     for _, row in df_manifest.iterrows():
                         sig_file_path = os.path.join(temp_dir, row['internal_location'])
-                        md5 = row['md5']
+                        md5 = str(row['md5'])  # Ensure it's a string
                         
                         if os.path.exists(sig_file_path):
                             # Read signature file
@@ -332,12 +400,12 @@ def process_signature_files(archive_dir: str, sig_type: str, output_dir: str,
                                 sig_record = {
                                     'md5': md5,
                                     'sample_id': sample_id,
-                                    'hash_function': sig_data.get('hash_function', ''),
+                                    'hash_function': str(sig_data.get('hash_function', '')),
                                     'molecule': '',
-                                    'filename': sig_data.get('filename', ''),
-                                    'class': sig_data.get('class', ''),
-                                    'email': sig_data.get('email', ''),
-                                    'license': sig_data.get('license', ''),
+                                    'filename': str(sig_data.get('filename', '')),
+                                    'class': str(sig_data.get('class', '')),
+                                    'email': str(sig_data.get('email', '')),
+                                    'license': str(sig_data.get('license', '')),
                                     'ksize': 0,
                                     'seed': 0,
                                     'max_hash': 0,
@@ -352,10 +420,10 @@ def process_signature_files(archive_dir: str, sig_type: str, output_dir: str,
                                 if 'signatures' in sig_data and len(sig_data['signatures']) > 0:
                                     signature = sig_data['signatures'][0]
                                     sig_record.update({
-                                        'molecule': signature.get('molecule', ''),
-                                        'ksize': signature.get('ksize', 0),
-                                        'seed': signature.get('seed', 0),
-                                        'max_hash': signature.get('max_hash', 0),
+                                        'molecule': str(signature.get('molecule', '')),
+                                        'ksize': int(signature.get('ksize', 0)),
+                                        'seed': int(signature.get('seed', 0)),
+                                        'max_hash': int(signature.get('max_hash', 0)),
                                         'num_mins': len(signature.get('mins', [])),
                                         'signature_size': len(str(signature.get('mins', []))),
                                         'has_abundances': bool(signature.get('abundances', []))
@@ -372,8 +440,8 @@ def process_signature_files(archive_dir: str, sig_type: str, output_dir: str,
                                             mins_records.append({
                                                 'sample_id': sample_id,
                                                 'md5': md5,
-                                                'min_hash': min_hash,
-                                                'abundance': abundance,
+                                                'min_hash': int(min_hash),
+                                                'abundance': int(abundance),
                                                 'position': i,
                                                 'ksize': sig_record['ksize'],
                                                 'partition_key': partition_key
