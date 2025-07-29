@@ -8,9 +8,6 @@ tables to **partitioned Parquet files** instead of a DuckDB database.
 Column sets and data‑cleaning follow import_to_db.py exactly; the
 only difference is the storage backend.
 
-Dependencies
-------------
-    pip install pandas pyarrow tqdm
 """
 from __future__ import annotations
 
@@ -34,7 +31,7 @@ from config import Config                      # noqa: E402  (before black)
 # ══════════════════════════════════════════════════════════════════════
 # GLOBALS
 # ══════════════════════════════════════════════════════════════════════
-ROW_GROUP_SIZE = 128 * 1024 * 1024          # 128 MiB row groups
+ROW_GROUP_SIZE = 128 * 1024 * 1024          # 128MiB row groups
 STAGING_ROOT   = Path(os.getenv("STAGING_DIR", "data_staging")).resolve()
 STAGING_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -46,7 +43,7 @@ def write_partitioned_parquet(df: pd.DataFrame, logical_path: str) -> None:
     Append *df* to STAGING_ROOT/logical_path/part‑<uuid>.parquet.
 
     Files are compressed with ZSTD‑3 and dictionary encoding so the
-    resulting staging area is typically < ⅓ of CSV size.
+    resulting staging area is typically ⅓ of CSV size.
     """
     if df is None or df.empty:
         return
@@ -379,7 +376,7 @@ def process_geographical_location_data(data_dir: Path):
         logging.warning("No geographical CSVs found")
         return
     dfs = []
-    for fp in tqdm(files, desc="Geo CSV"):
+    for fp in tqdm(files, desc="Geo CSV"):
         try:
             df_iter = pd.read_csv(fp, dtype=str, chunksize=50000,
                                   na_filter=False, keep_default_na=False)
@@ -465,8 +462,8 @@ def main():
             logging.exception(f"Failed archive {a}: {e}")
 
     # one‑off files (not inside each archive)
-    process_taxonomy_mapping(Path(args.data_dir))
-    process_geographical_location_data(Path(args.data_dir))
+    #process_taxonomy_mapping(Path(args.data_dir))
+    #process_geographical_location_data(Path(args.data_dir))
 
     print(f"\n🎉  Export finished. Parquet files are in {STAGING_ROOT}")
 
