@@ -52,6 +52,10 @@ def setup_logger():
 
 def optimize_duckdb_settings(conn: duckdb.DuckDBPyConnection):
     """Apply optimal DuckDB settings for bulk loading."""
+    # Get DuckDB version for compatibility
+    version_info = conn.execute("SELECT version()").fetchone()[0]
+    logging.info(f"DuckDB version: {version_info}")
+    
     # Increase memory limit for better performance
     conn.execute(f"SET memory_limit='{Config.DATABASE_MEMORY_LIMIT}'")
     
@@ -64,8 +68,16 @@ def optimize_duckdb_settings(conn: duckdb.DuckDBPyConnection):
     # Disable checkpoint on WAL for faster loading
     conn.execute("SET checkpoint_threshold='10GB'")
     
-    # Increase buffer pool size
-    conn.execute("SET buffer_pool_size='4GB'")
+    # For DuckDB v1.3.2, we don't have buffer_pool_size
+    # Instead, we can set other performance-related settings
+    
+    # Disable progress bar for bulk operations
+    conn.execute("SET enable_progress_bar=false")
+    
+    # Disable preserving insertion order for better performance
+    conn.execute("SET preserve_insertion_order=false")
+    
+    logging.info("DuckDB settings optimized for bulk loading")
 
 def create_schemas(conn: duckdb.DuckDBPyConnection):
     """Create all necessary schemas."""
@@ -274,9 +286,25 @@ def ingest_parquet_files(conn: duckdb.DuckDBPyConnection, parquet_dir: str,
     
     logging.info(f"Found {len(parquet_files)} parquet files for {table_name}")
     
-    # Use DuckDB's glob pattern to read all files at once
-    # This is much more efficient than reading file by file
-    pattern = str(table_path / "**/*.parquet")
+    # Check if we have partitioned data
+    partitions = [d for d in table_path.iterdir() if d.is_dir() and d.name.startswith("partition_key=")]
+    has_partition_key = len(partitions) > 0
+    
+    # Build the appropriate query based on whether we have partition_key
+    if has_partition_key:
+        # Use glob pattern to read all files at once
+        pattern = str(table_path / "**/*.parquet")
+        
+        # Get list of columns from first parquet file to check what to exclude
+        sample_file = str(parquet_files[0])
+        sample_cols = conn.execute(f"SELECT * FROM read_parquet('{sample_file}') LIMIT 0").description
+        col_names = [col[0] for col in sample_cols]
+        
+        # Build EXCLUDE clause if partition_key exists
+        exclude_clause = " EXCLUDE (partition_key)" if "partition_key" in col_names else ""
+    else:
+        pattern = str(table_path / "*.parquet")
+        exclude_clause = ""
     
     try:
         # First, check how many rows we're dealing with
@@ -284,12 +312,13 @@ def ingest_parquet_files(conn: duckdb.DuckDBPyConnection, parquet_dir: str,
         row_count = conn.execute(count_query).fetchone()[0]
         logging.info(f"Total rows to ingest for {table_name}: {row_count:,}")
         
+        if row_count == 0:
+            logging.warning(f"No data found in parquet files for {table_name}")
+            return
+        
         # For very large tables, use INSERT in chunks
         if row_count > 10_000_000:  # 10 million rows
             logging.info(f"Large table detected, using chunked insertion...")
-            
-            # Process by partition if the data is partitioned
-            partitions = [d for d in table_path.iterdir() if d.is_dir() and d.name.startswith("partition_key=")]
             
             if partitions:
                 # Process each partition separately
@@ -297,7 +326,7 @@ def ingest_parquet_files(conn: duckdb.DuckDBPyConnection, parquet_dir: str,
                     partition_pattern = str(partition_dir / "*.parquet")
                     insert_query = f"""
                         INSERT INTO {target_table}
-                        SELECT * EXCLUDE (partition_key)
+                        SELECT *{exclude_clause}
                         FROM read_parquet('{partition_pattern}')
                     """
                     conn.execute(insert_query)
@@ -310,7 +339,7 @@ def ingest_parquet_files(conn: duckdb.DuckDBPyConnection, parquet_dir: str,
                     offset = i * chunk_size
                     insert_query = f"""
                         INSERT INTO {target_table}
-                        SELECT * EXCLUDE (partition_key)
+                        SELECT *{exclude_clause}
                         FROM read_parquet('{pattern}')
                         LIMIT {chunk_size} OFFSET {offset}
                     """
@@ -319,7 +348,7 @@ def ingest_parquet_files(conn: duckdb.DuckDBPyConnection, parquet_dir: str,
             # For smaller tables, insert all at once
             insert_query = f"""
                 INSERT INTO {target_table}
-                SELECT * EXCLUDE (partition_key)
+                SELECT *{exclude_clause}
                 FROM read_parquet('{pattern}')
             """
             
@@ -333,6 +362,9 @@ def ingest_parquet_files(conn: duckdb.DuckDBPyConnection, parquet_dir: str,
         
     except Exception as e:
         logging.error(f"Error ingesting {table_name}: {e}")
+        # Log more details about the error
+        if "partition_key" in str(e):
+            logging.error(f"Note: Check if partition_key column exists in parquet files")
         raise
 
 def ingest_standalone_files(conn: duckdb.DuckDBPyConnection, data_dir: str):
@@ -369,32 +401,52 @@ def ingest_standalone_files(conn: duckdb.DuckDBPyConnection, data_dir: str):
                                 taxid_col = col
                         
                         if genome_col and taxid_col:
-                            # Load full file
+                            # Load full file using DuckDB's CSV reader
+                            # First check if file exists and is readable
+                            if not os.path.exists(file_path):
+                                logging.warning(f"File not found: {file_path}")
+                                continue
+                                
+                            # Use proper column names in query
                             query = f"""
                                 INSERT INTO temp_taxonomy_mapping
-                                SELECT "{genome_col}" as genome_id, "{taxid_col}" as taxid
-                                FROM read_csv_auto('{file_path}', sep='{sep}')
-                                WHERE "{genome_col}" IS NOT NULL AND "{taxid_col}" IS NOT NULL
+                                SELECT "{genome_col}" as genome_id, 
+                                       CAST("{taxid_col}" AS INTEGER) as taxid
+                                FROM read_csv('{file_path}', sep='{sep}', header=true)
+                                WHERE "{genome_col}" IS NOT NULL 
+                                  AND "{taxid_col}" IS NOT NULL
+                                  AND TRY_CAST("{taxid_col}" AS INTEGER) IS NOT NULL
                             """
                             conn.execute(query)
                             logging.info(f"Loaded taxonomy from {os.path.basename(file_path)}")
                             break
-                    except:
+                    except Exception as e:
+                        logging.debug(f"Failed to read {file_path} with separator '{sep}': {e}")
                         continue
                         
             except Exception as e:
                 logging.warning(f"Could not load taxonomy file {file_path}: {e}")
         
         # Update taxa_profiles with taxonomy IDs
-        if conn.execute("SELECT COUNT(*) FROM temp_taxonomy_mapping").fetchone()[0] > 0:
-            logging.info("Updating taxa_profiles with taxonomy IDs...")
-            conn.execute("""
-                UPDATE taxa_profiles.profiles
-                SET tax_id = tm.taxid
-                FROM temp_taxonomy_mapping tm
-                WHERE taxa_profiles.profiles.organism_id = tm.genome_id
-                  AND taxa_profiles.profiles.tax_id = -1
-            """)
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM temp_taxonomy_mapping").fetchone()[0]
+            if count > 0:
+                logging.info(f"Updating taxa_profiles with {count} taxonomy mappings...")
+                conn.execute("""
+                    UPDATE taxa_profiles.profiles
+                    SET tax_id = tm.taxid
+                    FROM temp_taxonomy_mapping tm
+                    WHERE taxa_profiles.profiles.organism_id = tm.genome_id
+                      AND taxa_profiles.profiles.tax_id = -1
+                """)
+                
+                updated = conn.execute("""
+                    SELECT COUNT(*) FROM taxa_profiles.profiles 
+                    WHERE tax_id != -1
+                """).fetchone()[0]
+                logging.info(f"Updated {updated} taxa profiles with taxonomy IDs")
+        except Exception as e:
+            logging.warning(f"Could not update taxonomy IDs: {e}")
     
     # Process geographical location files
     logging.info("Processing geographical location files...")
@@ -404,15 +456,38 @@ def ingest_standalone_files(conn: duckdb.DuckDBPyConnection, data_dir: str):
     geo_files.extend(glob.glob(os.path.join(data_dir, "*biosample_geographical*.csv")))
     geo_files.extend(glob.glob(os.path.join(data_dir, "output.csv")))
     
+    # Remove duplicates
+    geo_files = list(set(geo_files))
+    
     for file_path in tqdm(geo_files, desc="Loading geographical files"):
+        if not os.path.exists(file_path):
+            continue
+            
         try:
-            # Use DuckDB's CSV reader
-            query = f"""
-                INSERT INTO geographical_location_data.locations
-                SELECT * FROM read_csv_auto('{file_path}', all_varchar=true)
-            """
-            conn.execute(query)
-            logging.info(f"Loaded geographical data from {os.path.basename(file_path)}")
+            # Check if the CSV has the expected columns
+            df_sample = pd.read_csv(file_path, nrows=5)
+            expected_cols = ['accession', 'attribute_name', 'attribute_value', 'lat_lon',
+                           'palm_virome', 'elevation', 'center_name', 'country',
+                           'biome', 'confidence', 'sample_id']
+            
+            # Check if we have at least some of the expected columns
+            matching_cols = [col for col in expected_cols if col in df_sample.columns]
+            
+            if len(matching_cols) >= 5:  # At least 5 matching columns
+                # Use DuckDB's CSV reader with all_varchar to handle mixed types
+                query = f"""
+                    INSERT INTO geographical_location_data.locations
+                    SELECT * FROM read_csv('{file_path}', all_varchar=true, header=true)
+                """
+                conn.execute(query)
+                
+                count = conn.execute("""
+                    SELECT COUNT(*) FROM geographical_location_data.locations
+                """).fetchone()[0]
+                logging.info(f"Loaded {count} total geographical records")
+            else:
+                logging.warning(f"Skipping {file_path} - doesn't match expected schema")
+                
         except Exception as e:
             logging.warning(f"Could not load geographical file {file_path}: {e}")
 
@@ -420,19 +495,48 @@ def create_indexes(conn: duckdb.DuckDBPyConnection):
     """Create all indexes after data is loaded."""
     logging.info("Creating indexes...")
     
-    for table, column in tqdm(INDEXES_TO_CREATE, desc="Creating indexes"):
+    # Remove duplicates from index list
+    unique_indexes = list(set(INDEXES_TO_CREATE))
+    
+    for table, column in tqdm(unique_indexes, desc="Creating indexes"):
         index_name = f"idx_{table.replace('.', '_')}_{column}"
         try:
-            conn.execute(f"CREATE INDEX {index_name} ON {table} ({column})")
-            logging.info(f"Created index {index_name}")
+            # Check if table exists and has data
+            schema, table_name = table.split('.')
+            check_query = f"""
+                SELECT COUNT(*) 
+                FROM information_schema.tables 
+                WHERE table_schema = '{schema}' 
+                  AND table_name = '{table_name}'
+            """
+            if conn.execute(check_query).fetchone()[0] > 0:
+                # Check if table has rows
+                row_count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                if row_count > 0:
+                    conn.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ({column})")
+                    logging.info(f"Created index {index_name}")
+                else:
+                    logging.info(f"Skipping index {index_name} - table is empty")
+            else:
+                logging.warning(f"Table {table} does not exist, skipping index")
+                
         except Exception as e:
             logging.warning(f"Could not create index {index_name}: {e}")
 
 def vacuum_database(conn: duckdb.DuckDBPyConnection):
     """Vacuum and analyze the database for optimal performance."""
     logging.info("Running VACUUM ANALYZE...")
-    conn.execute("VACUUM ANALYZE")
-    logging.info("Database optimization complete")
+    try:
+        conn.execute("VACUUM ANALYZE")
+        logging.info("Database optimization complete")
+    except Exception as e:
+        logging.warning(f"VACUUM ANALYZE failed: {e}")
+        # Try just VACUUM if ANALYZE fails
+        try:
+            conn.execute("VACUUM")
+            logging.info("VACUUM complete (ANALYZE skipped)")
+        except Exception as e2:
+            logging.warning(f"VACUUM also failed: {e2}")
 
 def get_statistics(conn: duckdb.DuckDBPyConnection):
     """Get and display database statistics."""
@@ -461,118 +565,15 @@ def get_statistics(conn: duckdb.DuckDBPyConnection):
             print(f"{name:<30} {'No data':>20}")
     
     # Get database size
-    db_size = conn.execute("SELECT SUM(bytes) FROM duckdb_blocks()").fetchone()[0]
-    if db_size:
-        print(f"\n💾 Total database size: {db_size / (1024**3):.2f} GB")
-    
-    return stats
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description='Ingest Parquet files into DuckDB',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Examples:
-    python ingest_from_parquet.py --parquet-dir ./parquet_output
-    python ingest_from_parquet.py --database custom.db --no-indexes
-    python ingest_from_parquet.py --tables functional_profile taxa_profiles""")
-    
-    parser.add_argument('--parquet-dir', default='./parquet_output',
-                       help='Directory containing Parquet files (default: ./parquet_output)')
-    parser.add_argument('--data-dir', default=Config.DATA_DIR,
-                       help='Directory containing standalone CSV/TSV files')
-    parser.add_argument('--database', default=Config.DATABASE_PATH,
-                       help=f'Output database path (default: {Config.DATABASE_PATH})')
-    parser.add_argument('--tables', nargs='+',
-                       help='Specific tables to ingest (default: all)')
-    parser.add_argument('--no-indexes', action='store_true',
-                       help='Skip index creation')
-    parser.add_argument('--no-vacuum', action='store_true',
-                       help='Skip VACUUM ANALYZE')
-    parser.add_argument('--append', action='store_true',
-                       help='Append to existing database instead of recreating')
-    
-    return parser.parse_args()
-
-def main():
-    args = parse_args()
-    setup_logger()
-    
-    print(f"📁 Parquet directory: {args.parquet_dir}")
-    print(f"📁 Data directory: {args.data_dir}")
-    print(f"🗄️  Database path: {args.database}")
-    print(f"📊 Mode: {'Append' if args.append else 'Create new'}")
-    
-    # Check if parquet directory exists
-    if not Path(args.parquet_dir).exists():
-        print(f"❌ Parquet directory not found: {args.parquet_dir}")
-        print("Please run extract_to_parquet.py first.")
-        return
-    
-    # Create/connect to database
-    if not args.append and Path(args.database).exists():
-        backup_name = f"{args.database}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        shutil.copy2(args.database, backup_name)
-        print(f"📦 Created backup: {backup_name}")
-        os.remove(args.database)
-    
-    conn = duckdb.connect(args.database)
-    optimize_duckdb_settings(conn)
-    
-    # Create schemas and tables
-    create_schemas(conn)
-    create_tables(conn)
-    
-    # Define table mappings
-    table_mappings = [
-        ('functional_profiles', 'functional_profile.profiles'),
-        ('taxa_profiles', 'taxa_profiles.profiles'),
-        ('gather_data', 'functional_profile_data.gather_data'),
-        ('sigs_aa_manifests', 'sigs_aa.manifests'),
-        ('sigs_aa_signatures', 'sigs_aa.signatures'),
-        ('sigs_aa_signature_mins', 'sigs_aa.signature_mins'),
-        ('sigs_dna_manifests', 'sigs_dna.manifests'),
-        ('sigs_dna_signatures', 'sigs_dna.signatures'),
-        ('sigs_dna_signature_mins', 'sigs_dna.signature_mins')
-    ]
-    
-    # Filter tables if specified
-    if args.tables:
-        table_mappings = [(src, dst) for src, dst in table_mappings 
-                         if any(t in src for t in args.tables)]
-    
-    # Ingest each table
-    print("\n📥 Ingesting data...")
-    for source_table, target_table in table_mappings:
-        print(f"\n Processing {source_table} -> {target_table}")
-        try:
-            ingest_parquet_files(conn, args.parquet_dir, source_table, target_table)
-        except Exception as e:
-            logging.error(f"Failed to ingest {source_table}: {e}")
-            if not args.append:
-                raise
-    
-    # Ingest standalone files
-    print("\n📥 Processing standalone files...")
-    ingest_standalone_files(conn, args.data_dir)
-    
-    # Create indexes
-    if not args.no_indexes:
-        print("\n🔧 Creating indexes...")
-        create_indexes(conn)
-    
-    # Vacuum database
-    if not args.no_vacuum:
-        print("\n🧹 Optimizing database...")
-        vacuum_database(conn)
-    
-    # Display statistics
-    get_statistics(conn)
-    
-    conn.close()
-    
-    print("\n✅ Ingestion complete!")
-    print(f"📊 Database ready at: {args.database}")
-
-if __name__ == "__main__":
-    main()
-    
+    try:
+        # For DuckDB 1.3.2, use pragma database_size
+        db_size_info = conn.execute("CALL pragma_database_size()").fetchall()
+        total_size = 0
+        for row in db_size_info:
+            if len(row) >= 6:  # database_size returns multiple columns
+                total_size += row[2] + row[3] + row[4]  # file_size + wal_size + memory_size
+        
+        if total_size > 0:
+            print(f"\n💾 Total database size: {total_size / (1024**3):.2f} GB")
+    except Exception as e:
+        logging.debug(f"Could not get database size: {e}")
