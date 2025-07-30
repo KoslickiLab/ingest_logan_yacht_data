@@ -1,19 +1,17 @@
 #!/usr/bin/env python
 """
-import_parquet_to_duckdb.py  –  final version with taxonomy mapping
+import_parquet_to_duckdb.py  –  with ENUM→VARCHAR normalisation
 
-1.  Creates/refreshes a DuckDB database from Parquet shards
-2.  Applies GTDB taxonomy → tax_id mapping
-3.  Builds ART indexes (now including tax_id)
-
-Requires DuckDB ≥1.0, PyArrow ≥15.
+1.  Bulk‑loads all Parquet shards into DuckDB
+2.  Casts dictionary‑encoded ENUM columns back to VARCHAR
+3.  Applies GTDB tax_id mapping
+4.  Builds ART indexes
 """
 
 import argparse, os, duckdb, logging
 from pathlib import Path
 
-DEFAULT_DB    = "logan.db"
-DEFAULT_STAGE = "data_staging"
+DEFAULT_DB, DEFAULT_STAGE = "logan.db", "data_staging"
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -25,14 +23,30 @@ def ingest_table(conn, schema: str, table: str, path_glob: str):
     logging.info(f"› {schema}.{table}  ←  {g}")
     conn.execute(f"DROP TABLE IF EXISTS {schema}.{table}")
     conn.execute(f"CREATE TABLE {schema}.{table} AS SELECT * FROM read_parquet('{g}')")
+    normalize_enum_columns(conn, schema, table)
+
+
+def normalize_enum_columns(conn, schema: str, table: str):
+    """
+    DuckDB maps dictionary‑encoded strings to ENUM.  Cast back to VARCHAR
+    so ART index creation is always safe (work‑around for up‑to‑1.3 bug).
+    """
+    enum_cols = conn.execute(f"""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = '{schema}'
+          AND table_name   = '{table}'
+          AND data_type    LIKE 'ENUM%'
+    """).fetchall()
+    for (col,) in enum_cols:
+        logging.debug(f"  • Casting {schema}.{table}.{col} ENUM→VARCHAR")
+        conn.execute(f"""
+            ALTER TABLE {schema}.{table}
+            ALTER COLUMN "{col}" SET DATA TYPE VARCHAR
+        """)
 
 
 def apply_taxonomy_mapping(conn: duckdb.DuckDBPyConnection):
-    """
-    Replace the placeholder -1 in taxa_profiles.profiles.tax_id
-    with real NCBI/GTDB taxids from taxonomy_mapping.mappings.
-    """
-    # Does the mapping table exist?
     if not conn.execute("""
             SELECT COUNT(*) FROM information_schema.tables
             WHERE table_schema='taxonomy_mapping' AND table_name='mappings'
@@ -40,20 +54,36 @@ def apply_taxonomy_mapping(conn: duckdb.DuckDBPyConnection):
         logging.warning("No taxonomy_mapping.mappings table – skipping tax_id update")
         return
 
-    # Deduplicate mapping so each genome_id appears once
+    #logging.info("🧬  Deduplicating taxonomy mapping …")
+    #conn.execute("""
+    #    CREATE OR REPLACE TABLE taxonomy_mapping.mappings AS
+    #    SELECT genome_id, first(taxid) AS taxid
+    #    FROM taxonomy_mapping.mappings
+    #    GROUP BY genome_id
+    #""")
+    # ── 1.  Normalise TYPES  ────────────────────────────────────────────
+    # taxid → BIGINT; any non‑numeric token becomes NULL
+    conn.execute("""
+        ALTER TABLE taxonomy_mapping.mappings
+        ALTER COLUMN taxid SET DATA TYPE BIGINT USING try_cast(taxid AS BIGINT)
+    """)
+
     logging.info("🧬  Deduplicating taxonomy mapping …")
     conn.execute("""
         CREATE OR REPLACE TABLE taxonomy_mapping.mappings AS
-        SELECT genome_id, first(taxid) AS taxid
-        FROM taxonomy_mapping.mappings
-        GROUP BY genome_id
+        SELECT genome_id,
+               first(taxid) FILTER (WHERE taxid IS NOT NULL) AS taxid
+        FROM   taxonomy_mapping.mappings
+        GROUP  BY genome_id
+        HAVING taxid IS NOT NULL
     """)
 
-    # How many will be updated?
-    total_before = conn.execute("""
-        SELECT COUNT(*) FROM taxa_profiles.profiles
-        WHERE tax_id != -1
-    """).fetchone()[0]
+    # Ensure the target column is BIGINT too
+    conn.execute("""
+        ALTER TABLE taxa_profiles.profiles
+        ALTER COLUMN tax_id SET DATA TYPE BIGINT
+    """)
+
 
     logging.info("🔄  Updating taxa_profiles.profiles.tax_id …")
     conn.execute("""
@@ -63,13 +93,12 @@ def apply_taxonomy_mapping(conn: duckdb.DuckDBPyConnection):
         WHERE  tp.organism_id = tm.genome_id
     """)
 
-    total_after = conn.execute("""
-        SELECT COUNT(*) FROM taxa_profiles.profiles
-        WHERE tax_id != -1
+    mapped = conn.execute("""
+        SELECT COUNT(*) FROM taxa_profiles.profiles WHERE tax_id != -1
     """).fetchone()[0]
-
-    logging.info(f"✅  tax_id mapped for {total_after - total_before:,d} additional records "
-                 f"({total_after:,d} total mapped)")
+    logging.info(f"✅  tax_id now populated for {mapped:,d} records")
+    #drop mapping table to avoid ENUM columns later ──
+    conn.execute("DROP TABLE taxonomy_mapping.mappings")
 
 
 def build_indexes(conn: duckdb.DuckDBPyConnection):
@@ -101,9 +130,8 @@ def build_indexes(conn: duckdb.DuckDBPyConnection):
         CREATE INDEX idx_geo_accession                ON geographical_location_data.locations(accession);
         ANALYZE;
     """
-    for stmt in (s.strip() for s in statements.split(";")):
-        if stmt:
-            conn.execute(stmt)
+    for stmt in (s.strip() for s in statements.split(";") if s.strip()):
+        conn.execute(stmt)
 
 
 # ────────────────────────────────────────────────────────────────────
