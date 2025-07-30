@@ -1,7 +1,12 @@
 #!/usr/bin/env python
 """
-Create or refresh a DuckDB database from the Parquet staging area produced by
-export_to_parquet.py, then build all deferred ART indexes in one shot.
+import_parquet_to_duckdb.py  –  final version with taxonomy mapping
+
+1.  Creates/refreshes a DuckDB database from Parquet shards
+2.  Applies GTDB taxonomy → tax_id mapping
+3.  Builds ART indexes (now including tax_id)
+
+Requires DuckDB ≥1.0, PyArrow ≥15.
 """
 
 import argparse, os, duckdb, logging
@@ -12,30 +17,68 @@ DEFAULT_STAGE = "data_staging"
 
 
 # ────────────────────────────────────────────────────────────────────
-# Helper: load one logical table from its Parquet shards
+#  Helpers
 # ────────────────────────────────────────────────────────────────────
 def ingest_table(conn, schema: str, table: str, path_glob: str):
     conn.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
-    full_glob = os.path.abspath(path_glob)
-    logging.info(f"› {schema}.{table}  ←  {full_glob}")
-
+    g = os.path.abspath(path_glob)
+    logging.info(f"› {schema}.{table}  ←  {g}")
     conn.execute(f"DROP TABLE IF EXISTS {schema}.{table}")
-    conn.execute(f"""
-        CREATE TABLE {schema}.{table} AS
-        SELECT * FROM read_parquet('{full_glob}')
+    conn.execute(f"CREATE TABLE {schema}.{table} AS SELECT * FROM read_parquet('{g}')")
+
+
+def apply_taxonomy_mapping(conn: duckdb.DuckDBPyConnection):
+    """
+    Replace the placeholder -1 in taxa_profiles.profiles.tax_id
+    with real NCBI/GTDB taxids from taxonomy_mapping.mappings.
+    """
+    # Does the mapping table exist?
+    if not conn.execute("""
+            SELECT COUNT(*) FROM information_schema.tables
+            WHERE table_schema='taxonomy_mapping' AND table_name='mappings'
+        """).fetchone()[0]:
+        logging.warning("No taxonomy_mapping.mappings table – skipping tax_id update")
+        return
+
+    # Deduplicate mapping so each genome_id appears once
+    logging.info("🧬  Deduplicating taxonomy mapping …")
+    conn.execute("""
+        CREATE OR REPLACE TABLE taxonomy_mapping.mappings AS
+        SELECT genome_id, first(taxid) AS taxid
+        FROM taxonomy_mapping.mappings
+        GROUP BY genome_id
     """)
 
+    # How many will be updated?
+    total_before = conn.execute("""
+        SELECT COUNT(*) FROM taxa_profiles.profiles
+        WHERE tax_id != -1
+    """).fetchone()[0]
 
-# ────────────────────────────────────────────────────────────────────
-# Build all ART indexes – one statement per execute()
-# ────────────────────────────────────────────────────────────────────
+    logging.info("🔄  Updating taxa_profiles.profiles.tax_id …")
+    conn.execute("""
+        UPDATE taxa_profiles.profiles AS tp
+        SET    tax_id = tm.taxid
+        FROM   taxonomy_mapping.mappings AS tm
+        WHERE  tp.organism_id = tm.genome_id
+    """)
+
+    total_after = conn.execute("""
+        SELECT COUNT(*) FROM taxa_profiles.profiles
+        WHERE tax_id != -1
+    """).fetchone()[0]
+
+    logging.info(f"✅  tax_id mapped for {total_after - total_before:,d} additional records "
+                 f"({total_after:,d} total mapped)")
+
+
 def build_indexes(conn: duckdb.DuckDBPyConnection):
     logging.info("⏳ Building indexes …")
-
     statements = """
         CREATE INDEX idx_taxa_profiles_sample_id      ON taxa_profiles.profiles(sample_id);
         CREATE INDEX idx_taxa_profiles_organism_id    ON taxa_profiles.profiles(organism_id);
         CREATE INDEX idx_taxa_profiles_organism_name  ON taxa_profiles.profiles(organism_name);
+        CREATE INDEX idx_taxa_profiles_tax_id         ON taxa_profiles.profiles(tax_id);
 
         CREATE INDEX idx_functional_profile_sample_id ON functional_profile.profiles(sample_id);
         CREATE INDEX idx_functional_profile_ko_id     ON functional_profile.profiles(ko_id);
@@ -58,14 +101,13 @@ def build_indexes(conn: duckdb.DuckDBPyConnection):
         CREATE INDEX idx_geo_accession                ON geographical_location_data.locations(accession);
         ANALYZE;
     """
-
     for stmt in (s.strip() for s in statements.split(";")):
-        if stmt:          # skip empty strings after the final semicolon
+        if stmt:
             conn.execute(stmt)
 
 
 # ────────────────────────────────────────────────────────────────────
-# Main CLI entry point
+#  Main
 # ────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
@@ -86,9 +128,9 @@ def main():
 
     conn = duckdb.connect(args.database)
     conn.execute(f"PRAGMA threads={args.threads}")
-    conn.execute("PRAGMA memory_limit='2TB';")        # leave head‑room
+    conn.execute("PRAGMA memory_limit='3 TB';")
 
-    # ── bulk ingest ─────────────────────────────────────────────────
+    # ── bulk ingest ────────────────────────────────────────────────
     ingest_table(conn, "functional_profile",      "profiles",
                  f"{stage}/functional_profile/profiles/*.parquet")
     ingest_table(conn, "functional_profile_data", "gather_data",
@@ -107,13 +149,13 @@ def main():
     ingest_table(conn, "geographical_location_data", "locations",
                  f"{stage}/geographical_location_data/locations/*.parquet")
 
-    # optional: taxonomy mapping table (created by the exporter)
     mapping_dir = stage / "taxonomy_mapping" / "mappings"
     if mapping_dir.exists():
         ingest_table(conn, "taxonomy_mapping", "mappings",
                      f"{mapping_dir}/*.parquet")
+        apply_taxonomy_mapping(conn)
 
-    # ── indexes ─────────────────────────────────────────────────────
+    # ── indexes ────────────────────────────────────────────────────
     build_indexes(conn)
     conn.close()
     logging.info("🎉  DuckDB import finished.")
