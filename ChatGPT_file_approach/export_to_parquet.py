@@ -490,10 +490,14 @@ def main():
         p.join()
 
     # ── one‑off tables (outside archives) ────────────────────────────
+    # add logging info that the taxonomy mapping is being processed
+    logging.info("Processing taxonomy mapping files...")
     process_taxonomy_mapping(Path(args.data_dir))
+    logging.info("Processing geographical location data...")
     process_geographical_location_data(Path(args.data_dir))
-
-    print(f"\n🎉  Export finished. Parquet files are in {STAGING_ROOT}")
+    # turn this next line into a logging info message with timestamp
+    # print(f"\n🎉  Export finished. Parquet files are in {STAGING_ROOT}")
+    logging.info(f"🎉  Export finished. Parquet files are in {STAGING_ROOT}")
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)  # safe on Linux & macOS
