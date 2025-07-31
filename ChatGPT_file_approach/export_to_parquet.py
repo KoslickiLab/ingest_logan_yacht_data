@@ -539,8 +539,8 @@ def parse_args():
                     help="Number of consumer processes")
     ap.add_argument("--buffer-size", type=int, default=DEFAULT_BUFFER,
                     help="Bounded queue size (# extracted archives kept)")
-    ap.add_argument("--no-progress", action="store_true",
-                    help="Disable tqdm progress bars")
+    ap.add_argument("--dash-off", dest="dash_off", action="store_true",
+                    help="Disable live dashboard")
     return ap.parse_args()
 
 
@@ -559,6 +559,8 @@ def setup_logger():
 
 def main():
     args = parse_args()
+    if not hasattr(args, "dash_off"):
+        args.dash_off = False
 
     global STAGING_ROOT
     STAGING_ROOT = Path(args.staging_dir).resolve()
