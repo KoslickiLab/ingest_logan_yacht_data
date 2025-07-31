@@ -49,7 +49,7 @@ def normalize_enum_columns(conn, schema: str, table: str):
 
 def handle_null_columns(conn, schema: str, table: str):
     """
-    Replace NULL values in columns that contain only NULLs with a placeholder string.
+    Replace NULL values in columns that contain only NULLs with a placeholder.
     This maintains data transparency while preventing index creation issues.
     """
     # Get all columns and their data types
@@ -62,6 +62,10 @@ def handle_null_columns(conn, schema: str, table: str):
     null_only_columns = []
 
     for col_name, data_type in columns:
+        # Skip tax_id column as it needs special handling
+        if col_name == 'tax_id':
+            continue
+
         # Check if column has only NULL values
         non_null_count = conn.execute(f"""
             SELECT COUNT(*) 
@@ -181,12 +185,20 @@ def verify_column_stats(conn, schema: str, table: str, column: str) -> dict:
         stats['distinct_values'] = distinct_count
         stats['null_percentage'] = (stats['null_count'] / total_count * 100) if total_count > 0 else 0
 
-        # Check for placeholder values
-        placeholder_count = conn.execute(f"""
-            SELECT COUNT(*) FROM {schema}.{table} 
-            WHERE "{column}" = 'NULL_PLACEHOLDER'
+        # Check for placeholder values (only for string columns)
+        data_type = conn.execute(f"""
+            SELECT data_type FROM information_schema.columns 
+            WHERE table_schema = '{schema}' AND table_name = '{table}' AND column_name = '{column}'
         """).fetchone()[0]
-        stats['placeholder_count'] = placeholder_count
+
+        if any(x in data_type.upper() for x in ['VARCHAR', 'TEXT', 'STRING']):
+            placeholder_count = conn.execute(f"""
+                SELECT COUNT(*) FROM {schema}.{table} 
+                WHERE "{column}" = 'NULL_PLACEHOLDER'
+            """).fetchone()[0]
+            stats['placeholder_count'] = placeholder_count
+        else:
+            stats['placeholder_count'] = 0
 
         return stats
 
@@ -250,31 +262,22 @@ def build_indexes(conn: duckdb.DuckDBPyConnection):
             # Drop existing index if any
             conn.execute(f"DROP INDEX IF EXISTS {idx_name}")
 
-            # For taxa_profiles or columns with high NULL percentage, use B-tree indexes
-            if "taxa_profiles" in table_full or (stats and stats['null_percentage'] > 50):
-                logging.info(f"  Creating B-tree index {idx_name} on {table_full}({column})")
-                conn.execute(f"PRAGMA force_index_type='BTREE'")
-                conn.execute(f"CREATE INDEX {idx_name} ON {table_full}(\"{column}\")")
-                conn.execute(f"PRAGMA force_index_type='ART'")
-            else:
-                logging.info(f"  Creating index {idx_name} on {table_full}({column})")
-                conn.execute(f"CREATE INDEX {idx_name} ON {table_full}(\"{column}\")")
-
+            # Create index (let DuckDB choose the type)
+            logging.info(f"  Creating index {idx_name} on {table_full}({column})")
+            conn.execute(f"CREATE INDEX {idx_name} ON {table_full}(\"{column}\")")
             successful_indexes.append(idx_name)
 
         except duckdb.InternalException as e:
             if "node without metadata" in str(e):
                 logging.error(f"  ❌ ART index error for {idx_name}: {e}")
-                logging.info(f"  🔄 Attempting B-tree index fallback for {idx_name}")
+                logging.info(f"  🔄 Attempting to recreate without specific index type")
                 try:
                     conn.execute(f"DROP INDEX IF EXISTS {idx_name}")
-                    conn.execute(f"PRAGMA force_index_type='BTREE'")
                     conn.execute(f"CREATE INDEX {idx_name} ON {table_full}(\"{column}\")")
-                    conn.execute(f"PRAGMA force_index_type='ART'")
-                    logging.info(f"  ✅ B-tree index created successfully for {idx_name}")
-                    successful_indexes.append(f"{idx_name} (B-tree)")
+                    logging.info(f"  ✅ Index created successfully for {idx_name}")
+                    successful_indexes.append(f"{idx_name} (recreated)")
                 except Exception as fallback_error:
-                    logging.error(f"  ❌ B-tree index also failed for {idx_name}: {fallback_error}")
+                    logging.error(f"  ❌ Index recreation also failed for {idx_name}: {fallback_error}")
                     failed_indexes.append(idx_name)
             else:
                 logging.error(f"  ❌ Index creation failed for {idx_name}: {e}")
@@ -306,27 +309,27 @@ def build_indexes(conn: duckdb.DuckDBPyConnection):
 
     for schema, table in tables_to_check:
         try:
-            placeholder_cols = conn.execute(f"""
+            # Get all columns for this table
+            columns = conn.execute(f"""
                 SELECT column_name 
                 FROM information_schema.columns 
                 WHERE table_schema = '{schema}' AND table_name = '{table}'
-                AND column_name IN (
-                    SELECT DISTINCT column_name
-                    FROM (
-                        SELECT column_name
-                        FROM information_schema.columns
-                        WHERE table_schema = '{schema}' AND table_name = '{table}'
-                    ) cols
-                    WHERE EXISTS (
-                        SELECT 1 FROM {schema}.{table} 
-                        WHERE "{cols.column_name}" = 'NULL_PLACEHOLDER'
-                        LIMIT 1
-                    )
-                )
             """).fetchall()
 
+            placeholder_cols = []
+            for (col_name,) in columns:
+                # Check if this column has any NULL_PLACEHOLDER values
+                count = conn.execute(f"""
+                    SELECT COUNT(*) 
+                    FROM {schema}.{table} 
+                    WHERE "{col_name}" = 'NULL_PLACEHOLDER'
+                """).fetchone()[0]
+
+                if count > 0:
+                    placeholder_cols.append(col_name)
+
             if placeholder_cols:
-                logging.warning(f"  {schema}.{table} has NULL placeholders in: {[c[0] for c in placeholder_cols]}")
+                logging.warning(f"  {schema}.{table} has NULL placeholders in: {placeholder_cols}")
         except Exception as e:
             logging.debug(f"  Could not check {schema}.{table} for placeholders: {e}")
 
