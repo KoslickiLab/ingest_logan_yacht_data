@@ -449,6 +449,8 @@ def main():
     global STAGING_ROOT
     STAGING_ROOT = Path(args.staging_dir).resolve()
     STAGING_ROOT.mkdir(parents=True, exist_ok=True)
+    # make sure every fork/spawned process uses the same staging root
+    os.environ["STAGING_DIR"] = str(STAGING_ROOT)
     setup_logger()
 
     # ── discover & sort archives (small → large) ────────────────────
