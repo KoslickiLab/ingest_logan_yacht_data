@@ -247,115 +247,143 @@ SIG_SIGNATURE_COLS = ["md5", "sample_id", "hash_function", "molecule",
 SIG_MINS_COLS      = ["sample_id", "md5", "min_hash", "abundance",
                       "position", "ksize"]
 
-def process_signature_files(sig_dir: Optional[Path], sig_type: str,
-                            batch_size: int, workers: int):
+def _parse_zip_task(args):
+    """Standalone top‑level fn so it can be pickled by ProcessPool."""
+    zip_path, sig_type = args
+    import pandas as pd, json, gzip, tempfile, zipfile
+    from pathlib import Path
+
+    manifests, signatures, mins = [], [], []
+    fname = Path(zip_path).name
+    if fname.endswith(".unitigs.fa.sig.zip"):
+        sid = fname.replace(".unitigs.fa.sig.zip", "")
+    elif ".unitigs.fa_sketch_" in fname:
+        sid = fname.split(".unitigs.fa_sketch_")[0]
+    else:
+        sid = fname.replace(".zip", "")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(tmp)
+        mani_fp = Path(tmp) / "SOURMASH-MANIFEST.csv"
+        if not mani_fp.exists():
+            return manifests, signatures, mins
+        df_mani = pd.read_csv(mani_fp, skiprows=1)
+        df_mani["sample_id"] = sid
+        df_mani["archive_file"] = fname
+        manifests.extend(df_mani.to_dict("records"))
+
+        for row in df_mani.to_dict("records"):
+            sig_fp = Path(tmp) / row["internal_location"]
+            if not sig_fp.exists():
+                continue
+            raw = gzip.open(sig_fp, "rb").read().decode() if sig_fp.suffix == ".gz" \
+                  else sig_fp.read_text()
+            try:
+                js = json.loads(raw)
+                if isinstance(js, list):
+                    js = js[0]
+            except json.JSONDecodeError:
+                continue
+
+            sig_info = {
+                "md5": row["md5"], "sample_id": sid,
+                "hash_function": js.get("hash_function", ""),
+                "molecule": "", "filename": js.get("filename", ""),
+                "class": js.get("class", ""), "email": js.get("email", ""),
+                "license": js.get("license", ""), "ksize": 0,
+                "seed": 0, "max_hash": 0, "num_mins": 0,
+                "signature_size": 0, "has_abundances": False,
+                "archive_file": fname
+            }
+            mins_list, abund = [], []
+            if js.get("signatures"):
+                s0 = js["signatures"][0]
+                sig_info.update({
+                    "molecule": s0.get("molecule", ""),
+                    "ksize": s0.get("ksize", 0),
+                    "seed": s0.get("seed", 0),
+                    "max_hash": s0.get("max_hash", 0)
+                })
+                mins_list = s0.get("mins", [])
+                abund     = s0.get("abundances", [])
+                sig_info["num_mins"]       = len(mins_list)
+                sig_info["signature_size"] = len(str(mins_list))
+                sig_info["has_abundances"] = bool(abund)
+            signatures.append(sig_info)
+
+            if mins_list:
+                if abund and len(abund) == len(mins_list):
+                    for pos, (mh, ab) in enumerate(zip(mins_list, abund)):
+                        mins.append({
+                            "sample_id": sid, "md5": row["md5"],
+                            "min_hash": int(mh), "abundance": int(ab),
+                            "position": pos, "ksize": sig_info["ksize"]
+                        })
+                else:
+                    for pos, mh in enumerate(mins_list):
+                        mins.append({
+                            "sample_id": sid, "md5": row["md5"],
+                            "min_hash": int(mh), "abundance": 1,
+                            "position": pos, "ksize": sig_info["ksize"]
+                        })
+    return manifests, signatures, mins
+
+
+def process_signature_files(sig_dir: Path,
+                            sig_type: str,
+                            batch_size: int,
+                            procs: int):
+    """
+    Parse *every* .zip in sig_dir in parallel **across processes**
+    and stream results to Parquet.
+
+    Parameters
+    ----------
+    sig_dir     : Path      directory with *.zip
+    sig_type    : str       'sigs_aa' or 'sigs_dna'
+    batch_size  : int       flush Parquet when mins rows reach this
+    procs       : int       worker processes in the ProcessPool
+    """
     if not sig_dir or not sig_dir.exists():
         logging.warning(f"No {sig_type} directory; skipping")
         return
 
     zip_files = list(sig_dir.glob("*.zip"))
+    if not zip_files:
+        return
+
     manifests, signatures, mins = [], [], []
 
-    def extract_zip(zip_path: Path):
-        local_manifests, local_signatures, local_mins = [], [], []
-        fname = zip_path.name
-        if fname.endswith(".unitigs.fa.sig.zip"):
-            sid = fname.replace(".unitigs.fa.sig.zip", "")
-        elif ".unitigs.fa_sketch_" in fname:
-            sid = fname.split(".unitigs.fa_sketch_")[0]
-        else:
-            sid = fname.replace(".zip", "")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(tmp)
-            mani_fp = Path(tmp) / "SOURMASH-MANIFEST.csv"
-            if not mani_fp.exists():
-                return local_manifests, local_signatures, local_mins
-
-            df_mani = pd.read_csv(mani_fp, skiprows=1)
-            df_mani["sample_id"] = sid
-            df_mani["archive_file"] = fname
-            local_manifests.extend(df_mani.to_dict("records"))
-
-            for row in df_mani.to_dict("records"):
-                sig_fp = Path(tmp) / row["internal_location"]
-                if not sig_fp.exists():
-                    continue
-                raw = gzip.open(sig_fp, "rb").read().decode() \
-                      if sig_fp.suffix == ".gz" else sig_fp.read_text()
-                try:
-                    js = json.loads(raw)
-                    if isinstance(js, list):
-                        js = js[0]
-                except json.JSONDecodeError:
-                    continue
-
-                sig_info = {
-                    "md5": row["md5"], "sample_id": sid,
-                    "hash_function": js.get("hash_function", ""),
-                    "molecule": "", "filename": js.get("filename", ""),
-                    "class": js.get("class", ""), "email": js.get("email", ""),
-                    "license": js.get("license", ""), "ksize": 0,
-                    "seed": 0, "max_hash": 0, "num_mins": 0,
-                    "signature_size": 0, "has_abundances": False,
-                    "archive_file": fname
-                }
-                mins_list, abund = [], []
-                if js.get("signatures"):
-                    s0 = js["signatures"][0]
-                    sig_info.update({
-                        "molecule": s0.get("molecule", ""),
-                        "ksize": s0.get("ksize", 0),
-                        "seed": s0.get("seed", 0),
-                        "max_hash": s0.get("max_hash", 0)
-                    })
-                    mins_list = s0.get("mins", [])
-                    abund     = s0.get("abundances", [])
-                    sig_info["num_mins"]       = len(mins_list)
-                    sig_info["signature_size"] = len(str(mins_list))
-                    sig_info["has_abundances"] = bool(abund)
-                local_signatures.append(sig_info)
-
-                if mins_list:
-                    if abund and len(abund) == len(mins_list):
-                        for pos, (mh, ab) in enumerate(zip(mins_list, abund)):
-                            local_mins.append({
-                                "sample_id": sid, "md5": row["md5"],
-                                "min_hash": int(mh), "abundance": int(ab),
-                                "position": pos, "ksize": sig_info["ksize"]
-                            })
-                    else:
-                        for pos, mh in enumerate(mins_list):
-                            local_mins.append({
-                                "sample_id": sid, "md5": row["md5"],
-                                "min_hash": int(mh), "abundance": 1,
-                                "position": pos, "ksize": sig_info["ksize"]
-                            })
-        return local_manifests, local_signatures, local_mins
-
-    def flush():
-        if manifests:
-            write_partitioned_parquet(pd.DataFrame(manifests)[SIG_MANIFEST_COLS],
-                                      f"{sig_type}/manifests")
-            manifests.clear()
-        if signatures:
-            write_partitioned_parquet(pd.DataFrame(signatures)[SIG_SIGNATURE_COLS],
-                                      f"{sig_type}/signatures")
-            signatures.clear()
-        if mins:
-            write_partitioned_parquet(pd.DataFrame(mins)[SIG_MINS_COLS],
-                                      f"{sig_type}/signature_mins")
-            mins.clear()
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(extract_zip, z): z for z in zip_files}
-        for fut in as_completed(futs):
-            m, s, mn = fut.result()
+    with ProcessPoolExecutor(max_workers=procs) as pool:
+        tasks = pool.map(_parse_zip_task,
+                         ((str(z), sig_type) for z in zip_files))
+        for m, s, mn in tqdm(tasks, total=len(zip_files),
+                             desc=f"{sig_type} zips", position=5, leave=False):
             manifests.extend(m); signatures.extend(s); mins.extend(mn)
             if len(mins) >= batch_size:
-                flush()
-    flush()
+                _flush_signature_buffers(manifests, signatures, mins,
+                                         sig_type)
+    _flush_signature_buffers(manifests, signatures, mins, sig_type)
+
+
+def _flush_signature_buffers(manifests, signatures, mins, sig_type):
+    """Write the three signature tables and empty the buffers."""
+    if manifests:
+        write_partitioned_parquet(
+            pd.DataFrame(manifests)[SIG_MANIFEST_COLS],
+            f"{sig_type}/manifests")
+        manifests.clear()
+    if signatures:
+        write_partitioned_parquet(
+            pd.DataFrame(signatures)[SIG_SIGNATURE_COLS],
+            f"{sig_type}/signatures")
+        signatures.clear()
+    if mins:
+        write_partitioned_parquet(
+            pd.DataFrame(mins)[SIG_MINS_COLS],
+            f"{sig_type}/signature_mins")
+        mins.clear()
 
 # ▸ One‑off files (taxonomy map & geo) – unchanged
 def process_taxonomy_mapping(data_dir: Path):
