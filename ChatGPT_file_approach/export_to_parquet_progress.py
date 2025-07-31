@@ -1,24 +1,26 @@
 #!/usr/bin/env python
 """
-export_to_parquet.py  –  Design‑B parallel rewrite
-──────────────────────────────────────────────────
-* Two‑stage pipeline:
-    1. TarPool (ProcessPoolExecutor) extracts *.tar.gz → tmp dir
-    2. ConsumePool (multiprocessing.Process) converts → partitioned Parquet
-* All domain logic, column names, Parquet layout remain IDENTICAL
-  to the original implementation.
+export_to_parquet.py
+────────────────────
+Two‑stage producer/consumer pipeline **with live progress dashboard**.
 
-Hardware defaults target ≈50 % RAM usage on a 2 × 64‑core EPYC 7763
-with 4 TiB RAM (256 logical CPUs).
+* Domain logic, column names, Parquet layout — unchanged.
+* New `Progress` class (shared atomic counters) + a background thread that
+  refreshes a single status line 2×/s.
+* Zero overhead for small test runs: pass `--dash-off` to disable.
 """
+
 from __future__ import annotations
 
 # ── stdlib ───────────────────────────────────────────────────────────
 import argparse, gzip, json, logging, os, re, shutil, sys, tarfile, tempfile, \
        uuid, zipfile, multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from threading import Thread
+from time import sleep
+from typing import List
 from typing import List, Optional
 
 # ── 3rd‑party ────────────────────────────────────────────────────────
@@ -29,18 +31,68 @@ from tqdm import tqdm
 
 # ── project config (unchanged) ───────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import Config                              # noqa: E402 (black)
+from config import Config                              # noqa: E402
 
 # ═════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ═════════════════════════════════════════════════════════════════════
-ROW_GROUP_SIZE   = 128 * 1024 * 1024           # 128MiB
-STAGING_ROOT     = Path(os.getenv("STAGING_DIR", "data_staging")).resolve()
+ROW_GROUP_SIZE    = 128 * 1024 * 1024        # 128 MiB
+DEFAULT_PRODUCERS = 16
+DEFAULT_CONSUMERS = max(1, os.cpu_count() // 2)
+DEFAULT_BUFFER    = 10
+
+STAGING_ROOT = Path(os.getenv("STAGING_DIR", "data_staging")).resolve()
 STAGING_ROOT.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_PRODUCERS = 16                         # TarPool
-DEFAULT_CONSUMERS = max(1, os.cpu_count() // 2)  # ConsumePool
-DEFAULT_BUFFER    = 10                         # DirQueue size
+# ═════════════════════════════════════════════════════════════════════
+# Progress dashboard
+# ═════════════════════════════════════════════════════════════════════
+class Progress:
+    """Shared, lock‑free progress counters implemented with mp.Value."""
+    def __init__(self, total_archives: int):
+        self.total       = total_archives
+        self.extracted   = mp.Value("Q", 0)   # unsigned long long
+        self.processing  = mp.Value("Q", 0)
+        self.completed   = mp.Value("Q", 0)
+        self.failed      = mp.Value("Q", 0)
+
+    # helpers below hide the with‑statement noise
+    def inc(self, field: str, n: int = 1):
+        val = getattr(self, field)
+        with val.get_lock():
+            val.value += n
+
+    def value(self, field: str) -> int:
+        return getattr(self, field).value
+
+
+def _dashboard(tracker: Progress,
+               q: mp.JoinableQueue,
+               stop_evt: mp.Event,
+               refresh_hz: float = 2.0):
+    """Runs in a daemon thread inside the main process."""
+    start = datetime.now()
+    clear = "\033[2K\r"
+    while not stop_evt.is_set():
+        done   = tracker.value("completed")
+        failed = tracker.value("failed")
+        proc   = tracker.value("processing")
+        extr   = tracker.value("extracted")
+        queued = q.qsize() if hasattr(q, "qsize") else max(extr - done - proc, 0)
+        rate   = done / max((datetime.now() - start).total_seconds(), 1)
+        eta_sec = (tracker.total - done) / rate if rate else 0
+        eta   = str(timedelta(seconds=int(eta_sec)))
+        line = (f"Extracted {extr}/{tracker.total} · "
+                f"Queue {queued} · "
+                f"Processing {proc} · "
+                f"Done {done} · "
+                f"Fail {failed} · "
+                f"{rate:5.2f} / s · ETA {eta}")
+        print(f"{clear}{line}", end="", flush=True)
+        sleep(1 / refresh_hz)
+    print()              # final newline when we exit
+
+
 
 # ═════════════════════════════════════════════════════════════════════
 # Helper – Parquet writer  (UNCHANGED)
@@ -378,20 +430,21 @@ def process_geographical_location_data(data_dir: Path):
         write_partitioned_parquet(pd.concat(dfs, ignore_index=True),
                                   "geographical_location_data/locations")
 
+
 # ═════════════════════════════════════════════════════════════════════
-# Stage‑2  –  Consumer worker
+# Consumer
 # ═════════════════════════════════════════════════════════════════════
-def consumer_loop(q: mp.JoinableQueue, batch_size: int, zip_workers: int):
-    """
-    Repeatedly pull an extracted archive (func, taxa, aa, dna, tmpdir)
-    from *q* and run the original post‑processing pipeline.
-    """
+def consumer_loop(q: mp.JoinableQueue,
+                  batch_size: int,
+                  zip_workers: int,
+                  tracker: Progress):
     while True:
         item = q.get()
-        if item is None:       # sentinel → graceful shutdown
+        if item is None:          # sentinel
             q.task_done()
             break
 
+        tracker.inc("processing", +1)
         func, taxa, aa, dna, tmp = item
         try:
             process_functional_profiles(Path(func))
@@ -401,47 +454,51 @@ def consumer_loop(q: mp.JoinableQueue, batch_size: int, zip_workers: int):
                                     "sigs_aa", batch_size, zip_workers)
             process_signature_files(Path(dna) if dna else None,
                                     "sigs_dna", batch_size, zip_workers)
+            tracker.inc("completed", +1)
         except Exception as e:
             logging.exception(f"Consumer failed on {tmp}: {e}")
+            tracker.inc("failed", +1)
         finally:
+            tracker.inc("processing", -1)
             if Config.CLEANUP_TEMP_FILES:
                 shutil.rmtree(tmp, ignore_errors=True)
             q.task_done()
+
 
 # ═════════════════════════════════════════════════════════════════════
 # CLI / main
 # ═════════════════════════════════════════════════════════════════════
 def parse_args():
     ap = argparse.ArgumentParser(
-        description="Logan archive → partitioned Parquet exporter (producer/consumer)")
+        description="Logan archive → partitioned Parquet exporter")
     ap.add_argument("--data-dir", default=Config.DATA_DIR,
                     help="Directory with *.tar.gz archives")
     ap.add_argument("--staging-dir", default=str(STAGING_ROOT),
                     help="Output directory for Parquet shards")
     ap.add_argument("--zip-workers", type=int, default=Config.MAX_WORKERS,
-                    help="ThreadPool workers for zip extraction (sig files)")
+                    help="ThreadPool size for signature zip extraction")
     ap.add_argument("--batch-size", type=int, default=Config.BATCH_SIZE,
                     help="Flush signature mins every N rows")
-    ap.add_argument("--producers", type=int, default=DEFAULT_PRODUCERS,
-                    help="Max concurrent archive extractions")
-    ap.add_argument("--consumers", type=int, default=DEFAULT_CONSUMERS,
-                    help="Number of consumer processes")
-    ap.add_argument("--buffer-size", type=int, default=DEFAULT_BUFFER,
-                    help="Bounded queue size (# extracted archives kept)")
-    ap.add_argument("--no-progress", action="store_true",
-                    help="Disable tqdm progress bars")
+    ap.add_argument("--producers", type=int, default=DEFAULT_PRODUCERS)
+    ap.add_argument("--consumers", type=int, default=DEFAULT_CONSUMERS)
+    ap.add_argument("--buffer-size", type=int, default=DEFAULT_BUFFER)
+    ap.add_argument("--dash-off", action="store_true",
+                    help="Disable live dashboard")
     return ap.parse_args()
+
 
 def setup_logger():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = Path("logs"); log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / f"export_to_parquet_{ts}.log"
+    Path("logs").mkdir(exist_ok=True)
+    log_file = Path("logs") / f"export_to_parquet_{ts}.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s %(processName)s  %(message)s",
-        handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stderr)]
+        handlers=[logging.FileHandler(log_file),
+                  logging.StreamHandler(sys.stderr)]
     )
     logging.info(f"Log file: {log_file}")
+
 
 def main():
     args = parse_args()
@@ -449,52 +506,68 @@ def main():
     global STAGING_ROOT
     STAGING_ROOT = Path(args.staging_dir).resolve()
     STAGING_ROOT.mkdir(parents=True, exist_ok=True)
-    # make sure every fork/spawned process uses the same staging root
-    os.environ["STAGING_DIR"] = str(STAGING_ROOT)
+    os.environ["STAGING_DIR"] = str(STAGING_ROOT)     # visible to children
     setup_logger()
 
-    # ── discover & sort archives (small → large) ────────────────────
+    # ── locate archives, smallest → largest ─────────────────────────
     archives = sorted(Path(args.data_dir).glob("*.tar.gz"),
                       key=lambda p: p.stat().st_size)
+    if not archives:
+        raise SystemExit(f"No *.tar.gz files found in {args.data_dir}")
     logging.info(f"{len(archives)} archives discovered in {args.data_dir}")
 
-    # ── queues & consumer pool ───────────────────────────────────────
-    dir_q = mp.JoinableQueue(maxsize=args.buffer_size)
-    consumers = [mp.Process(target=consumer_loop,
-                            args=(dir_q, args.batch_size, args.zip_workers),
-                            name=f"consume-{i}") for i in range(args.consumers)]
-    for p in consumers:
-        p.daemon = True
+    # ── shared progress tracker & dashboard ─────────────────────────
+    tracker = Progress(len(archives))
+    stop_evt = mp.Event()
+    dir_q    = mp.JoinableQueue(maxsize=args.buffer_size)
+    if not args.dash_off:
+        dash_thread = Thread(target=_dashboard,
+                             args=(tracker, dir_q, stop_evt),
+                             daemon=True)
+        dash_thread.start()
+
+    # ── spawn consumer pool ─────────────────────────────────────────
+    consumers = []
+    for _ in range(args.consumers):
+        p = mp.Process(target=consumer_loop,
+                       args=(dir_q, args.batch_size, args.zip_workers, tracker),
+                       daemon=True)
         p.start()
+        consumers.append(p)
 
-    # ── producer pool (extract tar.gz) ───────────────────────────────
+    # ── producer pool: untar archives ───────────────────────────────
     with ProcessPoolExecutor(max_workers=args.producers) as ex:
-        fut_to_arch = {ex.submit(extract_nested_archives, str(a)): a
-                       for a in archives}
-
-        # push completed extractions to queue
-        for fut in tqdm(as_completed(fut_to_arch), total=len(fut_to_arch),
-                        desc="Extracting", disable=args.no_progress):
+        futures = {ex.submit(extract_nested_archives, str(a)): a
+                   for a in archives}
+        for fut in tqdm(as_completed(futures), total=len(futures),
+                        desc="Extracting"):
             try:
                 res = fut.result()
+                tracker.inc("extracted", +1)
+                dir_q.put(res)              # blocks if buffer full
             except Exception as e:
                 logging.exception(f"Extraction failed: {e}")
-                continue
-            dir_q.put(res)      # blocks when buffer is full
+                tracker.inc("failed", +1)
 
-    # ── signal consumers & wait ──────────────────────────────────────
-    for _ in range(args.consumers):
-        dir_q.put(None)         # sentinel
-    dir_q.join()                # wait for queue to drain
+    # ── stop consumers ──────────────────────────────────────────────
+    for _ in consumers:
+        dir_q.put(None)
+    dir_q.join()
     for p in consumers:
         p.join()
 
-    # ── one‑off tables (outside archives) ────────────────────────────
+    # ── stop dashboard ─────────────────────────────────────────────
+    stop_evt.set()
+    if not args.dash_off:
+        dash_thread.join()
+
+    # one‑off files (not inside each archive) ────────────────────────
     process_taxonomy_mapping(Path(args.data_dir))
     process_geographical_location_data(Path(args.data_dir))
 
     print(f"\n🎉  Export finished. Parquet files are in {STAGING_ROOT}")
 
+
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)  # safe on Linux & macOS
+    mp.set_start_method("spawn", force=True)
     main()
