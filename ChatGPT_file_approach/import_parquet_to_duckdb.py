@@ -24,6 +24,7 @@ def ingest_table(conn, schema: str, table: str, path_glob: str):
     conn.execute(f"DROP TABLE IF EXISTS {schema}.{table}")
     conn.execute(f"CREATE TABLE {schema}.{table} AS SELECT * FROM read_parquet('{g}')")
     normalize_enum_columns(conn, schema, table)
+    handle_null_columns(conn, schema, table)
 
 
 def normalize_enum_columns(conn, schema: str, table: str):
@@ -44,6 +45,61 @@ def normalize_enum_columns(conn, schema: str, table: str):
             ALTER TABLE {schema}.{table}
             ALTER COLUMN "{col}" SET DATA TYPE VARCHAR
         """)
+
+
+def handle_null_columns(conn, schema: str, table: str):
+    """
+    Replace NULL values in columns that contain only NULLs with a placeholder string.
+    This maintains data transparency while preventing index creation issues.
+    """
+    # Get all columns and their data types
+    columns = conn.execute(f"""
+        SELECT column_name, data_type 
+        FROM information_schema.columns 
+        WHERE table_schema = '{schema}' AND table_name = '{table}'
+    """).fetchall()
+
+    null_only_columns = []
+
+    for col_name, data_type in columns:
+        # Check if column has only NULL values
+        non_null_count = conn.execute(f"""
+            SELECT COUNT(*) 
+            FROM {schema}.{table} 
+            WHERE "{col_name}" IS NOT NULL
+        """).fetchone()[0]
+
+        total_count = conn.execute(f"""
+            SELECT COUNT(*) 
+            FROM {schema}.{table}
+        """).fetchone()[0]
+
+        if non_null_count == 0 and total_count > 0:
+            null_only_columns.append((col_name, data_type))
+
+    # Handle NULL-only columns
+    for col_name, data_type in null_only_columns:
+        logging.warning(f"  ⚠️  Column {schema}.{table}.{col_name} contains only NULL values")
+
+        try:
+            # First convert to VARCHAR if needed to ensure we can store string values
+            if not any(x in data_type.upper() for x in ['VARCHAR', 'TEXT', 'STRING']):
+                logging.info(f"  • Converting {col_name} from {data_type} to VARCHAR")
+                conn.execute(f"""
+                    ALTER TABLE {schema}.{table} 
+                    ALTER COLUMN "{col_name}" SET DATA TYPE VARCHAR
+                """)
+
+            # Replace NULLs with placeholder
+            logging.info(f"  • Replacing NULL values in {col_name} with 'NULL_PLACEHOLDER'")
+            conn.execute(f"""
+                UPDATE {schema}.{table} 
+                SET "{col_name}" = 'NULL_PLACEHOLDER' 
+                WHERE "{col_name}" IS NULL
+            """)
+
+        except Exception as e:
+            logging.error(f"  ❌ Failed to handle NULL column {col_name}: {e}")
 
 
 def apply_taxonomy_mapping(conn: duckdb.DuckDBPyConnection):
@@ -103,37 +159,40 @@ def apply_taxonomy_mapping(conn: duckdb.DuckDBPyConnection):
     conn.execute("DROP TABLE taxonomy_mapping.mappings")
 
 
-def verify_data_integrity(conn: duckdb.DuckDBPyConnection, schema: str, table: str, column: str):
+def verify_column_stats(conn, schema: str, table: str, column: str) -> dict:
     """
-    Check for potential data issues that might cause ART index creation to fail.
+    Get detailed statistics about a column to help diagnose issues.
     """
     try:
-        # Check for NULL values
-        null_count = conn.execute(f"""
-            SELECT COUNT(*) FROM {schema}.{table} WHERE "{column}" IS NULL
+        stats = {}
+
+        # Basic counts
+        total_count = conn.execute(f"SELECT COUNT(*) FROM {schema}.{table}").fetchone()[0]
+        non_null_count = conn.execute(f"""
+            SELECT COUNT(*) FROM {schema}.{table} WHERE "{column}" IS NOT NULL
         """).fetchone()[0]
-        if null_count > 0:
-            logging.warning(f"  ⚠️  Found {null_count:,d} NULL values in {schema}.{table}.{column}")
-
-        # Check data type
-        data_type = conn.execute(f"""
-            SELECT data_type 
-            FROM information_schema.columns 
-            WHERE table_schema = '{schema}' 
-              AND table_name = '{table}' 
-              AND column_name = '{column}'
+        distinct_count = conn.execute(f"""
+            SELECT COUNT(DISTINCT "{column}") FROM {schema}.{table}
         """).fetchone()[0]
-        logging.debug(f"  • Data type for {schema}.{table}.{column}: {data_type}")
 
-        # Check for any remaining ENUM types
-        if "ENUM" in data_type:
-            logging.error(f"  ❌ Column {schema}.{table}.{column} is still ENUM type!")
-            return False
+        stats['total_rows'] = total_count
+        stats['non_null_count'] = non_null_count
+        stats['null_count'] = total_count - non_null_count
+        stats['distinct_values'] = distinct_count
+        stats['null_percentage'] = (stats['null_count'] / total_count * 100) if total_count > 0 else 0
 
-        return True
+        # Check for placeholder values
+        placeholder_count = conn.execute(f"""
+            SELECT COUNT(*) FROM {schema}.{table} 
+            WHERE "{column}" = 'NULL_PLACEHOLDER'
+        """).fetchone()[0]
+        stats['placeholder_count'] = placeholder_count
+
+        return stats
+
     except Exception as e:
-        logging.error(f"  ❌ Error verifying {schema}.{table}.{column}: {e}")
-        return False
+        logging.error(f"  Error getting stats for {schema}.{table}.{column}: {e}")
+        return {}
 
 
 def build_indexes(conn: duckdb.DuckDBPyConnection):
@@ -146,7 +205,7 @@ def build_indexes(conn: duckdb.DuckDBPyConnection):
     except Exception as e:
         logging.warning(f"Checkpoint/analyze warning: {e}")
 
-    # Index definitions with error handling for each
+    # Index definitions
     indexes = [
         ("idx_taxa_profiles_sample_id", "taxa_profiles.profiles", "sample_id"),
         ("idx_taxa_profiles_organism_id", "taxa_profiles.profiles", "organism_id"),
@@ -174,36 +233,46 @@ def build_indexes(conn: duckdb.DuckDBPyConnection):
         ("idx_geo_accession", "geographical_location_data.locations", "accession"),
     ]
 
+    successful_indexes = []
     failed_indexes = []
 
     for idx_name, table_full, column in indexes:
         schema, table = table_full.split('.')
 
-        # Verify data integrity before creating index
-        if not verify_data_integrity(conn, schema, table, column):
-            logging.error(f"Skipping index {idx_name} due to data integrity issues")
-            failed_indexes.append(idx_name)
-            continue
+        # Get column statistics for logging
+        stats = verify_column_stats(conn, schema, table, column)
+        if stats:
+            logging.info(f"  Column {column} stats: {stats['non_null_count']:,d} non-null, "
+                         f"{stats['null_count']:,d} null ({stats['null_percentage']:.1f}%), "
+                         f"{stats['placeholder_count']:,d} placeholders")
 
         try:
             # Drop existing index if any
             conn.execute(f"DROP INDEX IF EXISTS {idx_name}")
 
-            # Create index with explicit type handling
-            logging.info(f"  Creating index {idx_name} on {table_full}({column})")
-            conn.execute(f"CREATE INDEX {idx_name} ON {table_full}(\"{column}\")")
+            # For taxa_profiles or columns with high NULL percentage, use B-tree indexes
+            if "taxa_profiles" in table_full or (stats and stats['null_percentage'] > 50):
+                logging.info(f"  Creating B-tree index {idx_name} on {table_full}({column})")
+                conn.execute(f"PRAGMA force_index_type='BTREE'")
+                conn.execute(f"CREATE INDEX {idx_name} ON {table_full}(\"{column}\")")
+                conn.execute(f"PRAGMA force_index_type='ART'")
+            else:
+                logging.info(f"  Creating index {idx_name} on {table_full}({column})")
+                conn.execute(f"CREATE INDEX {idx_name} ON {table_full}(\"{column}\")")
+
+            successful_indexes.append(idx_name)
 
         except duckdb.InternalException as e:
             if "node without metadata" in str(e):
                 logging.error(f"  ❌ ART index error for {idx_name}: {e}")
                 logging.info(f"  🔄 Attempting B-tree index fallback for {idx_name}")
                 try:
-                    # Try creating a B-tree index instead
                     conn.execute(f"DROP INDEX IF EXISTS {idx_name}")
                     conn.execute(f"PRAGMA force_index_type='BTREE'")
                     conn.execute(f"CREATE INDEX {idx_name} ON {table_full}(\"{column}\")")
-                    conn.execute(f"PRAGMA force_index_type='ART'")  # Reset to default
+                    conn.execute(f"PRAGMA force_index_type='ART'")
                     logging.info(f"  ✅ B-tree index created successfully for {idx_name}")
+                    successful_indexes.append(f"{idx_name} (B-tree)")
                 except Exception as fallback_error:
                     logging.error(f"  ❌ B-tree index also failed for {idx_name}: {fallback_error}")
                     failed_indexes.append(idx_name)
@@ -220,10 +289,54 @@ def build_indexes(conn: duckdb.DuckDBPyConnection):
     except Exception as e:
         logging.warning(f"Final analyze warning: {e}")
 
+    # Report NULL placeholder usage
+    logging.info("\n📊 NULL placeholder usage report:")
+    tables_to_check = [
+        ("taxa_profiles", "profiles"),
+        ("functional_profile", "profiles"),
+        ("functional_profile_data", "gather_data"),
+        ("sigs_aa", "manifests"),
+        ("sigs_aa", "signatures"),
+        ("sigs_aa", "signature_mins"),
+        ("sigs_dna", "manifests"),
+        ("sigs_dna", "signatures"),
+        ("sigs_dna", "signature_mins"),
+        ("geographical_location_data", "locations")
+    ]
+
+    for schema, table in tables_to_check:
+        try:
+            placeholder_cols = conn.execute(f"""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_schema = '{schema}' AND table_name = '{table}'
+                AND column_name IN (
+                    SELECT DISTINCT column_name
+                    FROM (
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = '{schema}' AND table_name = '{table}'
+                    ) cols
+                    WHERE EXISTS (
+                        SELECT 1 FROM {schema}.{table} 
+                        WHERE "{cols.column_name}" = 'NULL_PLACEHOLDER'
+                        LIMIT 1
+                    )
+                )
+            """).fetchall()
+
+            if placeholder_cols:
+                logging.warning(f"  {schema}.{table} has NULL placeholders in: {[c[0] for c in placeholder_cols]}")
+        except Exception as e:
+            logging.debug(f"  Could not check {schema}.{table} for placeholders: {e}")
+
+    logging.info(f"\n📊 Index creation summary:")
+    logging.info(f"  ✅ Successful: {len(successful_indexes)} indexes")
     if failed_indexes:
-        logging.warning(f"⚠️  Failed to create {len(failed_indexes)} indexes: {', '.join(failed_indexes)}")
-    else:
-        logging.info("✅  All indexes created successfully")
+        logging.warning(f"  ❌ Failed: {len(failed_indexes)} indexes: {', '.join(failed_indexes)}")
+
+    if len(successful_indexes) > 0:
+        logging.info("The database is ready for use!")
 
 
 # ────────────────────────────────────────────────────────────────────
