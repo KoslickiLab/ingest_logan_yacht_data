@@ -207,7 +207,7 @@ def verify_column_stats(conn, schema: str, table: str, column: str) -> dict:
         return {}
 
 
-def build_indexes(conn: duckdb.DuckDBPyConnection):
+def build_indexes(conn: duckdb.DuckDBPyConnection, fast: bool):
     logging.info("⏳ Building indexes …")
 
     # Force checkpoint and analyze before index creation
@@ -218,32 +218,60 @@ def build_indexes(conn: duckdb.DuckDBPyConnection):
         logging.warning(f"Checkpoint/analyze warning: {e}")
 
     # Index definitions
-    indexes = [
-        ("idx_taxa_profiles_sample_id", "taxa_profiles.profiles", "sample_id"),
-        ("idx_taxa_profiles_organism_id", "taxa_profiles.profiles", "organism_id"),
-        ("idx_taxa_profiles_organism_name", "taxa_profiles.profiles", "organism_name"),
-        ("idx_taxa_profiles_tax_id", "taxa_profiles.profiles", "tax_id"),
+    if not fast:
+        indexes = [
+            ("idx_taxa_profiles_sample_id", "taxa_profiles.profiles", "sample_id"),
+            ("idx_taxa_profiles_organism_id", "taxa_profiles.profiles", "organism_id"),
+            ("idx_taxa_profiles_organism_name", "taxa_profiles.profiles", "organism_name"),
+            ("idx_taxa_profiles_tax_id", "taxa_profiles.profiles", "tax_id"),
 
-        ("idx_functional_profile_sample_id", "functional_profile.profiles", "sample_id"),
-        ("idx_functional_profile_ko_id", "functional_profile.profiles", "ko_id"),
+            ("idx_functional_profile_sample_id", "functional_profile.profiles", "sample_id"),
+            ("idx_functional_profile_ko_id", "functional_profile.profiles", "ko_id"),
 
-        ("idx_sigs_aa_manifests_sample_id", "sigs_aa.manifests", "sample_id"),
-        ("idx_sigs_aa_manifests_md5", "sigs_aa.manifests", "md5"),
-        ("idx_sigs_aa_signatures_sample_id", "sigs_aa.signatures", "sample_id"),
-        ("idx_sigs_aa_signatures_md5", "sigs_aa.signatures", "md5"),
-        ("idx_sigs_aa_signature_mins_sample_id", "sigs_aa.signature_mins", "sample_id"),
-        ("idx_sigs_aa_signature_mins_md5", "sigs_aa.signature_mins", "md5"),
+            ("idx_sigs_aa_manifests_sample_id", "sigs_aa.manifests", "sample_id"),
+            ("idx_sigs_aa_manifests_md5", "sigs_aa.manifests", "md5"),
+            ("idx_sigs_aa_signatures_sample_id", "sigs_aa.signatures", "sample_id"),
+            ("idx_sigs_aa_signatures_md5", "sigs_aa.signatures", "md5"),
+            ("idx_sigs_aa_signature_mins_sample_id", "sigs_aa.signature_mins", "sample_id"),
+            ("idx_sigs_aa_signature_mins_md5", "sigs_aa.signature_mins", "md5"),
 
-        ("idx_sigs_dna_manifests_sample_id", "sigs_dna.manifests", "sample_id"),
-        ("idx_sigs_dna_manifests_md5", "sigs_dna.manifests", "md5"),
-        ("idx_sigs_dna_signatures_sample_id", "sigs_dna.signatures", "sample_id"),
-        ("idx_sigs_dna_signatures_md5", "sigs_dna.signatures", "md5"),
-        ("idx_sigs_dna_signature_mins_sample_id", "sigs_dna.signature_mins", "sample_id"),
-        ("idx_sigs_dna_signature_mins_md5", "sigs_dna.signature_mins", "md5"),
+            ("idx_sigs_dna_manifests_sample_id", "sigs_dna.manifests", "sample_id"),
+            ("idx_sigs_dna_manifests_md5", "sigs_dna.manifests", "md5"),
+            ("idx_sigs_dna_signatures_sample_id", "sigs_dna.signatures", "sample_id"),
+            ("idx_sigs_dna_signatures_md5", "sigs_dna.signatures", "md5"),
+            ("idx_sigs_dna_signature_mins_sample_id", "sigs_dna.signature_mins", "sample_id"),
+            ("idx_sigs_dna_signature_mins_md5", "sigs_dna.signature_mins", "md5"),
 
-        ("idx_gather_sample_id", "functional_profile_data.gather_data", "sample_id"),
-        ("idx_geo_accession", "geographical_location_data.locations", "accession"),
-    ]
+            ("idx_gather_sample_id", "functional_profile_data.gather_data", "sample_id"),
+            ("idx_geo_accession", "geographical_location_data.locations", "accession"),
+        ]
+    else:
+        indexes = [
+            ("idx_taxa_profiles_sample_id", "taxa_profiles.profiles", "sample_id"),
+            ("idx_taxa_profiles_organism_id", "taxa_profiles.profiles", "organism_id"),
+            ("idx_taxa_profiles_organism_name", "taxa_profiles.profiles", "organism_name"),
+            ("idx_taxa_profiles_tax_id", "taxa_profiles.profiles", "tax_id"),
+
+            ("idx_functional_profile_sample_id", "functional_profile.profiles", "sample_id"),
+            ("idx_functional_profile_ko_id", "functional_profile.profiles", "ko_id"),
+
+            #("idx_sigs_aa_manifests_sample_id", "sigs_aa.manifests", "sample_id"),
+            #("idx_sigs_aa_manifests_md5", "sigs_aa.manifests", "md5"),
+            #("idx_sigs_aa_signatures_sample_id", "sigs_aa.signatures", "sample_id"),
+            #("idx_sigs_aa_signatures_md5", "sigs_aa.signatures", "md5"),
+            #("idx_sigs_aa_signature_mins_sample_id", "sigs_aa.signature_mins", "sample_id"),
+            #("idx_sigs_aa_signature_mins_md5", "sigs_aa.signature_mins", "md5"),
+
+            #("idx_sigs_dna_manifests_sample_id", "sigs_dna.manifests", "sample_id"),
+            #("idx_sigs_dna_manifests_md5", "sigs_dna.manifests", "md5"),
+            #("idx_sigs_dna_signatures_sample_id", "sigs_dna.signatures", "sample_id"),
+            #("idx_sigs_dna_signatures_md5", "sigs_dna.signatures", "md5"),
+            #("idx_sigs_dna_signature_mins_sample_id", "sigs_dna.signature_mins", "sample_id"),
+            #("idx_sigs_dna_signature_mins_md5", "sigs_dna.signature_mins", "md5"),
+
+            ("idx_gather_sample_id", "functional_profile_data.gather_data", "sample_id"),
+           # ("idx_geo_accession", "geographical_location_data.locations", "accession"),
+        ]
 
     successful_indexes = []
     failed_indexes = []
@@ -353,6 +381,10 @@ def main():
                     help="Output *.db file (overwritten if exists)")
     ap.add_argument("--threads", type=int, default=os.cpu_count(),
                     help="DuckDB parallelism")
+    # add a boolean flag to enable/disable taxonomy, hashes, and geo indexing.
+    ap.add_argument("--fast", action='store_true',
+                    help="Disable the slow taxonomy mapping, hashes, and geo indexing steps")
+
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -392,7 +424,7 @@ def main():
         apply_taxonomy_mapping(conn)
 
     # ── indexes ────────────────────────────────────────────────────
-    build_indexes(conn)
+    build_indexes(conn, args.fast)
     conn.close()
     logging.info("🎉  DuckDB import finished.")
 
