@@ -558,8 +558,7 @@ def main():
     consumers = []
     for _ in range(args.consumers):
         p = mp.Process(target=consumer_loop,
-                       args=(dir_q, args.batch_size, args.zip_workers, tracker),
-                       daemon=True)
+                       args=(dir_q, args.batch_size, args.zip_workers, tracker))
         p.start()
         consumers.append(p)
 
