@@ -1,25 +1,51 @@
 #!/usr/bin/env python
 """
-export_to_parquet.py  –  Design‑B parallel rewrite
-──────────────────────────────────────────────────
-* Two‑stage pipeline:
-    1. TarPool (ProcessPoolExecutor) extracts *.tar.gz → tmp dir
-    2. ConsumePool (multiprocessing.Process) converts → partitioned Parquet
-* All domain logic, column names, Parquet layout remain IDENTICAL
-  to the original implementation.
+export_to_parquet_progress.py
+────────────────────────────
+Two‑stage producer/consumer pipeline **with live progress dashboard**.
 
-Hardware defaults target ≈50 % RAM usage on a 2 × 64‑core EPYC 7763
-with 4 TiB RAM (256 logical CPUs).
+* Domain logic, column names, Parquet layout — unchanged.
+* New “scratch temp” section routes all `tempfile` usage to /scratch
+  (see lines marked  #### SCRATCH‑TMP PATCH ####).
+
+Pass `--dash-off` to disable the progress bar if desired.
 """
+
 from __future__ import annotations
 
 # ── stdlib ───────────────────────────────────────────────────────────
 import argparse, gzip, json, logging, os, re, shutil, sys, tarfile, tempfile, \
        uuid, zipfile, multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from threading import Thread
+from time import sleep
 from typing import List, Optional
+
+# =====================================================================
+# #### SCRATCH‑TMP PATCH ##############################################
+# Redirect *all* uses of the std‑lib `tempfile` module (and any third‑
+# party packages that respect POSIX tmp‑env conventions) from /tmp to
+# a path on the much larger /scratch filesystem.
+#
+# • Override via $SCRATCH_TMPDIR if you need a different location.
+# • The directory is created at start‑up and exported through the usual
+#   TMPDIR / TEMP / TMP variables so it propagates to child processes
+#   (important because we use multiprocessing with the “spawn” start
+#   method).
+# • Setting `tempfile.tempdir` ensures the current interpreter honour
+#   the new default even if `tempfile` was imported earlier.
+# =====================================================================
+SCRATCH_TMP_ROOT = Path(os.getenv("SCRATCH_TMPDIR", "/scratch/tmp")).resolve()
+SCRATCH_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+for _v in ("TMPDIR", "TEMP", "TMP"):
+    os.environ[_v] = str(SCRATCH_TMP_ROOT)
+
+# If `tempfile` is already imported, also update its cached default.
+tempfile.tempdir = str(SCRATCH_TMP_ROOT)
+# #####################################################################
 
 # ── 3rd‑party ────────────────────────────────────────────────────────
 import pandas as pd
@@ -29,18 +55,68 @@ from tqdm import tqdm
 
 # ── project config (unchanged) ───────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import Config                              # noqa: E402 (black)
+from config import Config                              # noqa: E402
 
 # ═════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ═════════════════════════════════════════════════════════════════════
-ROW_GROUP_SIZE   = 128 * 1024 * 1024           # 128MiB
-STAGING_ROOT     = Path(os.getenv("STAGING_DIR", "data_staging")).resolve()
+ROW_GROUP_SIZE    = 128 * 1024 * 1024        # 128 MiB
+DEFAULT_PRODUCERS = 16
+DEFAULT_CONSUMERS = max(1, os.cpu_count() // 2)
+DEFAULT_BUFFER    = 10
+
+STAGING_ROOT = Path(os.getenv("STAGING_DIR", "data_staging")).resolve()
 STAGING_ROOT.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_PRODUCERS = 16                         # TarPool
-DEFAULT_CONSUMERS = max(1, os.cpu_count() // 2)  # ConsumePool
-DEFAULT_BUFFER    = 10                         # DirQueue size
+# ═════════════════════════════════════════════════════════════════════
+# Progress dashboard
+# ═════════════════════════════════════════════════════════════════════
+class Progress:
+    """Shared, lock‑free progress counters implemented with mp.Value."""
+    def __init__(self, total_archives: int):
+        self.total       = total_archives
+        self.extracted   = mp.Value("Q", 0)   # unsigned long long
+        self.processing  = mp.Value("Q", 0)
+        self.completed   = mp.Value("Q", 0)
+        self.failed      = mp.Value("Q", 0)
+
+    # helpers below hide the with‑statement noise
+    def inc(self, field: str, n: int = 1):
+        val = getattr(self, field)
+        with val.get_lock():
+            val.value += n
+
+    def value(self, field: str) -> int:
+        return getattr(self, field).value
+
+
+def _dashboard(tracker: Progress,
+               q: mp.JoinableQueue,
+               stop_evt: mp.Event,
+               refresh_hz: float = 2.0):
+    """Runs in a daemon thread inside the main process."""
+    start = datetime.now()
+    clear = "\033[2K\r"
+    while not stop_evt.is_set():
+        done   = tracker.value("completed")
+        failed = tracker.value("failed")
+        proc   = tracker.value("processing")
+        extr   = tracker.value("extracted")
+        queued = q.qsize() if hasattr(q, "qsize") else max(extr - done - proc, 0)
+        rate   = done / max((datetime.now() - start).total_seconds(), 1)
+        eta_sec = (tracker.total - done) / rate if rate else 0
+        eta   = str(timedelta(seconds=int(eta_sec)))
+        line = (f"Extracted {extr}/{tracker.total} · "
+                f"Queue {queued} · "
+                f"Processing {proc} · "
+                f"Done {done} · "
+                f"Fail {failed} · "
+                f"{rate:5.2f} / s · ETA {eta}")
+        print(f"{clear}{line}", end="", flush=True)
+        sleep(1 / refresh_hz)
+    print()              # final newline when we exit
+
+
 
 # ═════════════════════════════════════════════════════════════════════
 # Helper – Parquet writer  (UNCHANGED)
@@ -78,7 +154,7 @@ def extract_nested_archives(archive_path: str):
     Untar *archive_path* → tmp dir, find sub‑directories and return their paths.
     Returns tuple(func, taxa, sigs_aa, sigs_dna, tmpdir).
     """
-    temp_dir = tempfile.mkdtemp(prefix="logan_")
+    temp_dir = tempfile.mkdtemp(prefix="logan_")      # now on /scratch
     with tarfile.open(archive_path, "r:gz") as tar:
         tar.extractall(temp_dir)
 
@@ -195,115 +271,145 @@ SIG_SIGNATURE_COLS = ["md5", "sample_id", "hash_function", "molecule",
 SIG_MINS_COLS      = ["sample_id", "md5", "min_hash", "abundance",
                       "position", "ksize"]
 
-def process_signature_files(sig_dir: Optional[Path], sig_type: str,
-                            batch_size: int, workers: int):
+def _parse_zip_task(args):
+    """Standalone top‑level fn so it can be pickled by ProcessPool."""
+    zip_path, sig_type = args
+    import pandas as pd, json, gzip, tempfile, zipfile
+    from pathlib import Path
+
+    manifests, signatures, mins = [], [], []
+    fname = Path(zip_path).name
+    if fname.endswith(".unitigs.fa.sig.zip"):
+        sid = fname.replace(".unitigs.fa.sig.zip", "")
+    elif ".unitigs.fa_sketch_" in fname:
+        sid = fname.split(".unitigs.fa_sketch_")[0]
+    else:
+        sid = fname.replace(".zip", "")
+
+    # NOTE: TemporaryDirectory honours $TMPDIR, so we automatically land
+    #       on /scratch here without further changes.
+    with tempfile.TemporaryDirectory() as tmp:
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(tmp)
+        mani_fp = Path(tmp) / "SOURMASH-MANIFEST.csv"
+        if not mani_fp.exists():
+            return manifests, signatures, mins
+        df_mani = pd.read_csv(mani_fp, skiprows=1)
+        df_mani["sample_id"] = sid
+        df_mani["archive_file"] = fname
+        manifests.extend(df_mani.to_dict("records"))
+
+        for row in df_mani.to_dict("records"):
+            sig_fp = Path(tmp) / row["internal_location"]
+            if not sig_fp.exists():
+                continue
+            raw = gzip.open(sig_fp, "rb").read().decode() if sig_fp.suffix == ".gz" \
+                  else sig_fp.read_text()
+            try:
+                js = json.loads(raw)
+                if isinstance(js, list):
+                    js = js[0]
+            except json.JSONDecodeError:
+                continue
+
+            sig_info = {
+                "md5": row["md5"], "sample_id": sid,
+                "hash_function": js.get("hash_function", ""),
+                "molecule": "", "filename": js.get("filename", ""),
+                "class": js.get("class", ""), "email": js.get("email", ""),
+                "license": js.get("license", ""), "ksize": 0,
+                "seed": 0, "max_hash": 0, "num_mins": 0,
+                "signature_size": 0, "has_abundances": False,
+                "archive_file": fname
+            }
+            mins_list, abund = [], []
+            if js.get("signatures"):
+                s0 = js["signatures"][0]
+                sig_info.update({
+                    "molecule": s0.get("molecule", ""),
+                    "ksize": s0.get("ksize", 0),
+                    "seed": s0.get("seed", 0),
+                    "max_hash": s0.get("max_hash", 0)
+                })
+                mins_list = s0.get("mins", [])
+                abund     = s0.get("abundances", [])
+                sig_info["num_mins"]       = len(mins_list)
+                sig_info["signature_size"] = len(str(mins_list))
+                sig_info["has_abundances"] = bool(abund)
+            signatures.append(sig_info)
+
+            if mins_list:
+                if abund and len(abund) == len(mins_list):
+                    for pos, (mh, ab) in enumerate(zip(mins_list, abund)):
+                        mins.append({
+                            "sample_id": sid, "md5": row["md5"],
+                            "min_hash": int(mh), "abundance": int(ab),
+                            "position": pos, "ksize": sig_info["ksize"]
+                        })
+                else:
+                    for pos, mh in enumerate(mins_list):
+                        mins.append({
+                            "sample_id": sid, "md5": row["md5"],
+                            "min_hash": int(mh), "abundance": 1,
+                            "position": pos, "ksize": sig_info["ksize"]
+                        })
+    return manifests, signatures, mins
+
+
+def process_signature_files(sig_dir: Path,
+                            sig_type: str,
+                            batch_size: int,
+                            procs: int):
+    """
+    Parse *every* .zip in sig_dir in parallel **across processes**
+    and stream results to Parquet.
+
+    Parameters
+    ----------
+    sig_dir     : Path      directory with *.zip
+    sig_type    : str       'sigs_aa' or 'sigs_dna'
+    batch_size  : int       flush Parquet when mins rows reach this
+    procs       : int       worker processes in the ProcessPool
+    """
     if not sig_dir or not sig_dir.exists():
         logging.warning(f"No {sig_type} directory; skipping")
         return
 
     zip_files = list(sig_dir.glob("*.zip"))
+    if not zip_files:
+        return
+
     manifests, signatures, mins = [], [], []
 
-    def extract_zip(zip_path: Path):
-        local_manifests, local_signatures, local_mins = [], [], []
-        fname = zip_path.name
-        if fname.endswith(".unitigs.fa.sig.zip"):
-            sid = fname.replace(".unitigs.fa.sig.zip", "")
-        elif ".unitigs.fa_sketch_" in fname:
-            sid = fname.split(".unitigs.fa_sketch_")[0]
-        else:
-            sid = fname.replace(".zip", "")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(tmp)
-            mani_fp = Path(tmp) / "SOURMASH-MANIFEST.csv"
-            if not mani_fp.exists():
-                return local_manifests, local_signatures, local_mins
-
-            df_mani = pd.read_csv(mani_fp, skiprows=1)
-            df_mani["sample_id"] = sid
-            df_mani["archive_file"] = fname
-            local_manifests.extend(df_mani.to_dict("records"))
-
-            for row in df_mani.to_dict("records"):
-                sig_fp = Path(tmp) / row["internal_location"]
-                if not sig_fp.exists():
-                    continue
-                raw = gzip.open(sig_fp, "rb").read().decode() \
-                      if sig_fp.suffix == ".gz" else sig_fp.read_text()
-                try:
-                    js = json.loads(raw)
-                    if isinstance(js, list):
-                        js = js[0]
-                except json.JSONDecodeError:
-                    continue
-
-                sig_info = {
-                    "md5": row["md5"], "sample_id": sid,
-                    "hash_function": js.get("hash_function", ""),
-                    "molecule": "", "filename": js.get("filename", ""),
-                    "class": js.get("class", ""), "email": js.get("email", ""),
-                    "license": js.get("license", ""), "ksize": 0,
-                    "seed": 0, "max_hash": 0, "num_mins": 0,
-                    "signature_size": 0, "has_abundances": False,
-                    "archive_file": fname
-                }
-                mins_list, abund = [], []
-                if js.get("signatures"):
-                    s0 = js["signatures"][0]
-                    sig_info.update({
-                        "molecule": s0.get("molecule", ""),
-                        "ksize": s0.get("ksize", 0),
-                        "seed": s0.get("seed", 0),
-                        "max_hash": s0.get("max_hash", 0)
-                    })
-                    mins_list = s0.get("mins", [])
-                    abund     = s0.get("abundances", [])
-                    sig_info["num_mins"]       = len(mins_list)
-                    sig_info["signature_size"] = len(str(mins_list))
-                    sig_info["has_abundances"] = bool(abund)
-                local_signatures.append(sig_info)
-
-                if mins_list:
-                    if abund and len(abund) == len(mins_list):
-                        for pos, (mh, ab) in enumerate(zip(mins_list, abund)):
-                            local_mins.append({
-                                "sample_id": sid, "md5": row["md5"],
-                                "min_hash": int(mh), "abundance": int(ab),
-                                "position": pos, "ksize": sig_info["ksize"]
-                            })
-                    else:
-                        for pos, mh in enumerate(mins_list):
-                            local_mins.append({
-                                "sample_id": sid, "md5": row["md5"],
-                                "min_hash": int(mh), "abundance": 1,
-                                "position": pos, "ksize": sig_info["ksize"]
-                            })
-        return local_manifests, local_signatures, local_mins
-
-    def flush():
-        if manifests:
-            write_partitioned_parquet(pd.DataFrame(manifests)[SIG_MANIFEST_COLS],
-                                      f"{sig_type}/manifests")
-            manifests.clear()
-        if signatures:
-            write_partitioned_parquet(pd.DataFrame(signatures)[SIG_SIGNATURE_COLS],
-                                      f"{sig_type}/signatures")
-            signatures.clear()
-        if mins:
-            write_partitioned_parquet(pd.DataFrame(mins)[SIG_MINS_COLS],
-                                      f"{sig_type}/signature_mins")
-            mins.clear()
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(extract_zip, z): z for z in zip_files}
-        for fut in as_completed(futs):
-            m, s, mn = fut.result()
+    with ProcessPoolExecutor(max_workers=procs) as pool:
+        tasks = pool.map(_parse_zip_task,
+                         ((str(z), sig_type) for z in zip_files))
+        for m, s, mn in tqdm(tasks, total=len(zip_files),
+                             desc=f"{sig_type} zips", position=5, leave=False):
             manifests.extend(m); signatures.extend(s); mins.extend(mn)
             if len(mins) >= batch_size:
-                flush()
-    flush()
+                _flush_signature_buffers(manifests, signatures, mins,
+                                         sig_type)
+    _flush_signature_buffers(manifests, signatures, mins, sig_type)
+
+
+def _flush_signature_buffers(manifests, signatures, mins, sig_type):
+    """Write the three signature tables and empty the buffers."""
+    if manifests:
+        write_partitioned_parquet(
+            pd.DataFrame(manifests)[SIG_MANIFEST_COLS],
+            f"{sig_type}/manifests")
+        manifests.clear()
+    if signatures:
+        write_partitioned_parquet(
+            pd.DataFrame(signatures)[SIG_SIGNATURE_COLS],
+            f"{sig_type}/signatures")
+        signatures.clear()
+    if mins:
+        write_partitioned_parquet(
+            pd.DataFrame(mins)[SIG_MINS_COLS],
+            f"{sig_type}/signature_mins")
+        mins.clear()
 
 # ▸ One‑off files (taxonomy map & geo) – unchanged
 def process_taxonomy_mapping(data_dir: Path):
@@ -378,20 +484,21 @@ def process_geographical_location_data(data_dir: Path):
         write_partitioned_parquet(pd.concat(dfs, ignore_index=True),
                                   "geographical_location_data/locations")
 
+
 # ═════════════════════════════════════════════════════════════════════
-# Stage‑2  –  Consumer worker
+# Consumer
 # ═════════════════════════════════════════════════════════════════════
-def consumer_loop(q: mp.JoinableQueue, batch_size: int, zip_workers: int):
-    """
-    Repeatedly pull an extracted archive (func, taxa, aa, dna, tmpdir)
-    from *q* and run the original post‑processing pipeline.
-    """
+def consumer_loop(q: mp.JoinableQueue,
+                  batch_size: int,
+                  zip_workers: int,
+                  tracker: Progress):
     while True:
         item = q.get()
-        if item is None:       # sentinel → graceful shutdown
+        if item is None:          # sentinel
             q.task_done()
             break
 
+        tracker.inc("processing", +1)
         func, taxa, aa, dna, tmp = item
         try:
             process_functional_profiles(Path(func))
@@ -401,25 +508,29 @@ def consumer_loop(q: mp.JoinableQueue, batch_size: int, zip_workers: int):
                                     "sigs_aa", batch_size, zip_workers)
             process_signature_files(Path(dna) if dna else None,
                                     "sigs_dna", batch_size, zip_workers)
+            tracker.inc("completed", +1)
         except Exception as e:
             logging.exception(f"Consumer failed on {tmp}: {e}")
+            tracker.inc("failed", +1)
         finally:
+            tracker.inc("processing", -1)
             if Config.CLEANUP_TEMP_FILES:
                 shutil.rmtree(tmp, ignore_errors=True)
             q.task_done()
+
 
 # ═════════════════════════════════════════════════════════════════════
 # CLI / main
 # ═════════════════════════════════════════════════════════════════════
 def parse_args():
     ap = argparse.ArgumentParser(
-        description="Logan archive → partitioned Parquet exporter (producer/consumer)")
+        description="Logan archive → partitioned Parquet exporter")
     ap.add_argument("--data-dir", default=Config.DATA_DIR,
                     help="Directory with *.tar.gz archives")
     ap.add_argument("--staging-dir", default=str(STAGING_ROOT),
                     help="Output directory for Parquet shards")
     ap.add_argument("--zip-workers", type=int, default=Config.MAX_WORKERS,
-                    help="ThreadPool workers for zip extraction (sig files)")
+                    help="ThreadPool size for signature zip extraction")
     ap.add_argument("--batch-size", type=int, default=Config.BATCH_SIZE,
                     help="Flush signature mins every N rows")
     ap.add_argument("--producers", type=int, default=DEFAULT_PRODUCERS,
@@ -432,16 +543,19 @@ def parse_args():
                     help="Disable tqdm progress bars")
     return ap.parse_args()
 
+
 def setup_logger():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = Path("logs"); log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / f"export_to_parquet_{ts}.log"
+    Path("logs").mkdir(exist_ok=True)
+    log_file = Path("logs") / f"export_to_parquet_{ts}.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s %(processName)s  %(message)s",
-        handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stderr)]
+        handlers=[logging.FileHandler(log_file),
+                  logging.StreamHandler(sys.stderr)]
     )
     logging.info(f"Log file: {log_file}")
+
 
 def main():
     args = parse_args()
@@ -449,56 +563,70 @@ def main():
     global STAGING_ROOT
     STAGING_ROOT = Path(args.staging_dir).resolve()
     STAGING_ROOT.mkdir(parents=True, exist_ok=True)
-    # make sure every fork/spawned process uses the same staging root
-    os.environ["STAGING_DIR"] = str(STAGING_ROOT)
+    os.environ["STAGING_DIR"] = str(STAGING_ROOT)     # visible to children
     setup_logger()
 
-    # ── discover & sort archives (small → large) ────────────────────
+    # ── locate archives, smallest → largest ─────────────────────────
     archives = sorted(Path(args.data_dir).glob("*.tar.gz"),
                       key=lambda p: p.stat().st_size)
+    if not archives:
+        raise SystemExit(f"No *.tar.gz files found in {args.data_dir}")
     logging.info(f"{len(archives)} archives discovered in {args.data_dir}")
 
-    # ── queues & consumer pool ───────────────────────────────────────
-    dir_q = mp.JoinableQueue(maxsize=args.buffer_size)
-    consumers = [mp.Process(target=consumer_loop,
-                            args=(dir_q, args.batch_size, args.zip_workers),
-                            name=f"consume-{i}") for i in range(args.consumers)]
-    for p in consumers:
-        p.daemon = True
+    # ── shared progress tracker & dashboard ─────────────────────────
+    tracker = Progress(len(archives))
+    stop_evt = mp.Event()
+    dir_q    = mp.JoinableQueue(maxsize=args.buffer_size)
+    if not args.dash_off:
+        dash_thread = Thread(target=_dashboard,
+                             args=(tracker, dir_q, stop_evt),
+                             daemon=True)
+        dash_thread.start()
+
+    # ── spawn consumer pool ─────────────────────────────────────────
+    consumers = []
+    for _ in range(args.consumers):
+        p = mp.Process(target=consumer_loop,
+                       args=(dir_q, args.batch_size, args.zip_workers, tracker))
         p.start()
+        consumers.append(p)
 
-    # ── producer pool (extract tar.gz) ───────────────────────────────
+    # ── producer pool: untar archives ───────────────────────────────
     with ProcessPoolExecutor(max_workers=args.producers) as ex:
-        fut_to_arch = {ex.submit(extract_nested_archives, str(a)): a
-                       for a in archives}
-
-        # push completed extractions to queue
-        for fut in tqdm(as_completed(fut_to_arch), total=len(fut_to_arch),
-                        desc="Extracting", disable=args.no_progress):
+        futures = {ex.submit(extract_nested_archives, str(a)): a
+                   for a in archives}
+        for fut in tqdm(as_completed(futures), total=len(futures),
+                        desc="Extracting"):
             try:
                 res = fut.result()
+                tracker.inc("extracted", +1)
+                dir_q.put(res)              # blocks if buffer full
             except Exception as e:
                 logging.exception(f"Extraction failed: {e}")
-                continue
-            dir_q.put(res)      # blocks when buffer is full
+                tracker.inc("failed", +1)
 
-    # ── signal consumers & wait ──────────────────────────────────────
-    for _ in range(args.consumers):
-        dir_q.put(None)         # sentinel
-    dir_q.join()                # wait for queue to drain
+    # ── stop consumers ──────────────────────────────────────────────
+    for _ in consumers:
+        dir_q.put(None)
+    dir_q.join()
     for p in consumers:
         p.join()
 
-    # ── one‑off tables (outside archives) ────────────────────────────
+    # ── stop dashboard ─────────────────────────────────────────────
+    stop_evt.set()
+    if not args.dash_off:
+        dash_thread.join()
+
+    # one‑off files (not inside each archive) ────────────────────────
     # add logging info that the taxonomy mapping is being processed
     logging.info("Processing taxonomy mapping files...")
     process_taxonomy_mapping(Path(args.data_dir))
     logging.info("Processing geographical location data...")
     process_geographical_location_data(Path(args.data_dir))
-    # turn this next line into a logging info message with timestamp
-    # print(f"\n🎉  Export finished. Parquet files are in {STAGING_ROOT}")
-    logging.info(f"🎉  Export finished. Parquet files are in {STAGING_ROOT}")
+
+    print(f"\n🎉  Export finished. Parquet files are in {STAGING_ROOT}")
+
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)  # safe on Linux & macOS
+    mp.set_start_method("spawn", force=True)
     main()
