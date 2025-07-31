@@ -1,0 +1,504 @@
+#!/usr/bin/env python
+"""
+export_to_parquet.py  –  Design‑B parallel rewrite
+──────────────────────────────────────────────────
+* Two‑stage pipeline:
+    1. TarPool (ProcessPoolExecutor) extracts *.tar.gz → tmp dir
+    2. ConsumePool (multiprocessing.Process) converts → partitioned Parquet
+* All domain logic, column names, Parquet layout remain IDENTICAL
+  to the original implementation.
+
+Hardware defaults target ≈50 % RAM usage on a 2 × 64‑core EPYC 7763
+with 4 TiB RAM (256 logical CPUs).
+"""
+from __future__ import annotations
+
+# ── stdlib ───────────────────────────────────────────────────────────
+import argparse, gzip, json, logging, os, re, shutil, sys, tarfile, tempfile, \
+       uuid, zipfile, multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+
+# ── 3rd‑party ────────────────────────────────────────────────────────
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from tqdm import tqdm
+
+# ── project config (unchanged) ───────────────────────────────────────
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import Config                              # noqa: E402 (black)
+
+# ═════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═════════════════════════════════════════════════════════════════════
+ROW_GROUP_SIZE   = 128 * 1024 * 1024           # 128MiB
+STAGING_ROOT     = Path(os.getenv("STAGING_DIR", "data_staging")).resolve()
+STAGING_ROOT.mkdir(parents=True, exist_ok=True)
+
+DEFAULT_PRODUCERS = 16                         # TarPool
+DEFAULT_CONSUMERS = max(1, os.cpu_count() // 2)  # ConsumePool
+DEFAULT_BUFFER    = 10                         # DirQueue size
+
+# ═════════════════════════════════════════════════════════════════════
+# Helper – Parquet writer  (UNCHANGED)
+# ═════════════════════════════════════════════════════════════════════
+def write_partitioned_parquet(df: pd.DataFrame, logical_path: str) -> None:
+    """Append *df* to STAGING_ROOT/logical_path/part‑<uuid>.parquet."""
+    if df is None or df.empty:
+        return
+
+    table_dir = STAGING_ROOT / logical_path
+    table_dir.mkdir(parents=True, exist_ok=True)
+
+    # force deterministic dtype inference
+    for col in df.select_dtypes(include=["object"]).columns:
+        df[col] = df[col].astype("string")
+
+    out_file = table_dir / f"part-{uuid.uuid4()}.parquet"
+    table    = pa.Table.from_pandas(df, preserve_index=False)
+
+    pq.write_table(
+        table,
+        where=out_file,
+        compression="zstd",
+        use_dictionary=True,
+        row_group_size=ROW_GROUP_SIZE,
+        data_page_size=1_048_576,
+        write_statistics=True,
+    )
+
+# ═════════════════════════════════════════════════════════════════════
+# Stage‑1  –  Extract one archive
+# ═════════════════════════════════════════════════════════════════════
+def extract_nested_archives(archive_path: str):
+    """
+    Untar *archive_path* → tmp dir, find sub‑directories and return their paths.
+    Returns tuple(func, taxa, sigs_aa, sigs_dna, tmpdir).
+    """
+    temp_dir = tempfile.mkdtemp(prefix="logan_")
+    with tarfile.open(archive_path, "r:gz") as tar:
+        tar.extractall(temp_dir)
+
+    func = taxa = sigs_aa = sigs_dna = None
+    for root, dirs, _ in os.walk(temp_dir):
+        if "func_profiles" in dirs:        # anchor directory
+            parent = Path(root)
+            func   = parent / "func_profiles"
+            if "taxa_profiles" in dirs:
+                taxa = parent / "taxa_profiles"
+            if "sigs_aa" in dirs:
+                sigs_aa = parent / "sigs_aa"
+            if "sigs_dna" in dirs:
+                sigs_dna = parent / "sigs_dna"
+            break
+
+    if func is None:
+        raise FileNotFoundError(f"{archive_path}: func_profiles missing")
+
+    # Return simple strings – picklable & lightweight
+    return str(func), str(taxa) if taxa else "", \
+           str(sigs_aa) if sigs_aa else "", \
+           str(sigs_dna) if sigs_dna else "", \
+           temp_dir
+
+# ═════════════════════════════════════════════════════════════════════
+# Stage‑2 helpers  (ALL UNCHANGED BUSINESS LOGIC)
+# ═════════════════════════════════════════════════════════════════════
+# ▸ Functional profile + gather
+def process_functional_profiles(func_profiles_dir: Path):
+    files = list(func_profiles_dir.glob("*_functional_profile"))
+    dfs: List[pd.DataFrame] = []
+    for fp in files:
+        sid = fp.name.split("_functional_profile")[0]
+        try:
+            df = pd.read_csv(fp)
+        except pd.errors.EmptyDataError:
+            continue
+        if df.empty:
+            continue
+        df["sample_id"] = sid
+        dfs.append(df[["sample_id", "ko_id", "abundance"]])
+    if dfs:
+        write_partitioned_parquet(pd.concat(dfs, ignore_index=True),
+                                  "functional_profile/profiles")
+
+def process_gather_files(func_profiles_dir: Path):
+    files = list(func_profiles_dir.glob("*.unitigs.fa_gather_*.tmp"))
+    dfs: List[pd.DataFrame] = []
+    for fp in files:
+        sid = fp.name.split(".unitigs.fa_gather_")[0]
+        try:
+            df = pd.read_csv(fp)
+        except pd.errors.EmptyDataError:
+            continue
+        if df.empty:
+            continue
+        df["sample_id"] = sid
+        cols = ["sample_id"] + [c for c in df.columns if c != "sample_id"]
+        dfs.append(df[cols])
+    if dfs:
+        write_partitioned_parquet(pd.concat(dfs, ignore_index=True),
+                                  "functional_profile_data/gather_data")
+
+# ▸ Taxa profiles
+EXPECTED_TAXA_COLS = [
+    'sample_id', 'organism_name', 'organism_id', 'tax_id',
+    'num_unique_kmers_in_genome_sketch', 'num_total_kmers_in_genome_sketch',
+    'scale_factor', 'num_exclusive_kmers_in_sample_sketch',
+    'num_total_kmers_in_sample_sketch', 'min_coverage', 'p_vals',
+    'num_exclusive_kmers_to_genome', 'num_exclusive_kmers_to_genome_coverage',
+    'num_matches', 'acceptance_threshold_with_coverage',
+    'actual_confidence_with_coverage', 'alt_confidence_mut_rate_with_coverage',
+    'in_sample_est'
+]
+def process_taxa_profiles(taxa_dir: Optional[Path]):
+    if not taxa_dir or not taxa_dir.exists():
+        logging.warning("No taxa_profiles directory; skipping")
+        return
+    excel_files = list(taxa_dir.glob("result_*.xlsx"))
+    dfs: List[pd.DataFrame] = []
+    for fp in excel_files:
+        sid = fp.name.split("_ANI_")[1].split(".xlsx")[0]
+        try:
+            sheets = pd.read_excel(fp, sheet_name=None)
+        except Exception as e:
+            logging.error(f"Failed reading {fp}: {e}")
+            continue
+        for df in sheets.values():
+            if df.empty:
+                continue
+            df["sample_id"] = sid
+            if "organism_name" in df.columns:
+                df["organism_id"] = df["organism_name"].str.extract(
+                    r"^(GC[AF]_\d+\.\d+)", expand=False)
+            df["tax_id"] = -1
+            for col in EXPECTED_TAXA_COLS:
+                if col not in df.columns:
+                    df[col] = False if col == "in_sample_est" else 0
+            dfs.append(df[EXPECTED_TAXA_COLS])
+    if dfs:
+        write_partitioned_parquet(pd.concat(dfs, ignore_index=True),
+                                  "taxa_profiles/profiles")
+
+# ▸ Signature archives (AA & DNA)
+SIG_MANIFEST_COLS  = ["internal_location", "md5", "md5short", "ksize",
+                      "moltype", "num", "scaled", "n_hashes",
+                      "with_abundance", "name", "filename",
+                      "sample_id", "archive_file"]
+SIG_SIGNATURE_COLS = ["md5", "sample_id", "hash_function", "molecule",
+                      "filename", "class", "email", "license", "ksize",
+                      "seed", "max_hash", "num_mins", "signature_size",
+                      "has_abundances", "archive_file"]
+SIG_MINS_COLS      = ["sample_id", "md5", "min_hash", "abundance",
+                      "position", "ksize"]
+
+def process_signature_files(sig_dir: Optional[Path], sig_type: str,
+                            batch_size: int, workers: int):
+    if not sig_dir or not sig_dir.exists():
+        logging.warning(f"No {sig_type} directory; skipping")
+        return
+
+    zip_files = list(sig_dir.glob("*.zip"))
+    manifests, signatures, mins = [], [], []
+
+    def extract_zip(zip_path: Path):
+        local_manifests, local_signatures, local_mins = [], [], []
+        fname = zip_path.name
+        if fname.endswith(".unitigs.fa.sig.zip"):
+            sid = fname.replace(".unitigs.fa.sig.zip", "")
+        elif ".unitigs.fa_sketch_" in fname:
+            sid = fname.split(".unitigs.fa_sketch_")[0]
+        else:
+            sid = fname.replace(".zip", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(tmp)
+            mani_fp = Path(tmp) / "SOURMASH-MANIFEST.csv"
+            if not mani_fp.exists():
+                return local_manifests, local_signatures, local_mins
+
+            df_mani = pd.read_csv(mani_fp, skiprows=1)
+            df_mani["sample_id"] = sid
+            df_mani["archive_file"] = fname
+            local_manifests.extend(df_mani.to_dict("records"))
+
+            for row in df_mani.to_dict("records"):
+                sig_fp = Path(tmp) / row["internal_location"]
+                if not sig_fp.exists():
+                    continue
+                raw = gzip.open(sig_fp, "rb").read().decode() \
+                      if sig_fp.suffix == ".gz" else sig_fp.read_text()
+                try:
+                    js = json.loads(raw)
+                    if isinstance(js, list):
+                        js = js[0]
+                except json.JSONDecodeError:
+                    continue
+
+                sig_info = {
+                    "md5": row["md5"], "sample_id": sid,
+                    "hash_function": js.get("hash_function", ""),
+                    "molecule": "", "filename": js.get("filename", ""),
+                    "class": js.get("class", ""), "email": js.get("email", ""),
+                    "license": js.get("license", ""), "ksize": 0,
+                    "seed": 0, "max_hash": 0, "num_mins": 0,
+                    "signature_size": 0, "has_abundances": False,
+                    "archive_file": fname
+                }
+                mins_list, abund = [], []
+                if js.get("signatures"):
+                    s0 = js["signatures"][0]
+                    sig_info.update({
+                        "molecule": s0.get("molecule", ""),
+                        "ksize": s0.get("ksize", 0),
+                        "seed": s0.get("seed", 0),
+                        "max_hash": s0.get("max_hash", 0)
+                    })
+                    mins_list = s0.get("mins", [])
+                    abund     = s0.get("abundances", [])
+                    sig_info["num_mins"]       = len(mins_list)
+                    sig_info["signature_size"] = len(str(mins_list))
+                    sig_info["has_abundances"] = bool(abund)
+                local_signatures.append(sig_info)
+
+                if mins_list:
+                    if abund and len(abund) == len(mins_list):
+                        for pos, (mh, ab) in enumerate(zip(mins_list, abund)):
+                            local_mins.append({
+                                "sample_id": sid, "md5": row["md5"],
+                                "min_hash": int(mh), "abundance": int(ab),
+                                "position": pos, "ksize": sig_info["ksize"]
+                            })
+                    else:
+                        for pos, mh in enumerate(mins_list):
+                            local_mins.append({
+                                "sample_id": sid, "md5": row["md5"],
+                                "min_hash": int(mh), "abundance": 1,
+                                "position": pos, "ksize": sig_info["ksize"]
+                            })
+        return local_manifests, local_signatures, local_mins
+
+    def flush():
+        if manifests:
+            write_partitioned_parquet(pd.DataFrame(manifests)[SIG_MANIFEST_COLS],
+                                      f"{sig_type}/manifests")
+            manifests.clear()
+        if signatures:
+            write_partitioned_parquet(pd.DataFrame(signatures)[SIG_SIGNATURE_COLS],
+                                      f"{sig_type}/signatures")
+            signatures.clear()
+        if mins:
+            write_partitioned_parquet(pd.DataFrame(mins)[SIG_MINS_COLS],
+                                      f"{sig_type}/signature_mins")
+            mins.clear()
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(extract_zip, z): z for z in zip_files}
+        for fut in as_completed(futs):
+            m, s, mn = fut.result()
+            manifests.extend(m); signatures.extend(s); mins.extend(mn)
+            if len(mins) >= batch_size:
+                flush()
+    flush()
+
+# ▸ One‑off files (taxonomy map & geo) – unchanged
+def process_taxonomy_mapping(data_dir: Path):
+    tsv  = list(data_dir.glob("*.tsv"))
+    txt  = list(data_dir.glob("*taxonomy*.txt"))
+    tab  = list(data_dir.glob("*taxonomy*.tab"))
+    files = tsv + txt + tab
+    if not files:
+        logging.warning("No taxonomy mapping files found")
+        return
+    dfs = []
+    for fp in files:
+        try:
+            df = pd.read_csv(fp, sep=None, engine="python")
+        except Exception as e:
+            logging.error(f"Failed {fp}: {e}")
+            continue
+        genome_col = next((c for c in df.columns
+                           if re.search(r"(genome|accession)", c, re.I)), None)
+        taxid_col  = next((c for c in df.columns
+                           if re.search(r"tax(id)?", c, re.I)), None)
+        if not genome_col or not taxid_col:
+            logging.warning(f"Skip {fp}: no genome/taxid cols")
+            continue
+        df = df.rename(columns={genome_col: "genome_id",
+                                taxid_col: "taxid"})
+        df = df[["genome_id", "taxid"]].dropna()
+        df["source_file"] = fp.name
+        dfs.append(df)
+    if dfs:
+        write_partitioned_parquet(pd.concat(dfs, ignore_index=True),
+                                  "taxonomy_mapping/mappings")
+
+GEO_EXPECTED = [
+    'accession', 'attribute_name', 'attribute_value', 'lat_lon',
+    'palm_virome', 'elevation', 'center_name', 'country',
+    'biome', 'confidence', 'sample_id'
+]
+def process_geographical_location_data(data_dir: Path):
+    patterns = ["*geographical_location*.csv", "*geo_location*.csv",
+                "*biosample_geographical*.csv", "output.csv"]
+    files: List[Path] = []
+    for pat in patterns:
+        files.extend(data_dir.glob(pat))
+    files = list(dict.fromkeys(files))
+    if not files:
+        logging.warning("No geographical CSVs found")
+        return
+
+    dfs = []
+    for fp in files:
+        try:
+            df_iter = pd.read_csv(fp, dtype=str, chunksize=50_000,
+                                  na_filter=False, keep_default_na=False)
+        except pd.errors.EmptyDataError:
+            continue
+        except Exception:
+            try:    # tiny file → read whole
+                df_iter = [pd.read_csv(fp, dtype=str,
+                                       na_filter=False, keep_default_na=False)]
+            except Exception as e:
+                logging.error(f"Fail geo {fp}: {e}")
+                continue
+        for chunk in df_iter:
+            if chunk.empty:
+                continue
+            for col in GEO_EXPECTED:
+                if col not in chunk.columns:
+                    chunk[col] = None
+            dfs.append(chunk[GEO_EXPECTED])
+    if dfs:
+        write_partitioned_parquet(pd.concat(dfs, ignore_index=True),
+                                  "geographical_location_data/locations")
+
+# ═════════════════════════════════════════════════════════════════════
+# Stage‑2  –  Consumer worker
+# ═════════════════════════════════════════════════════════════════════
+def consumer_loop(q: mp.JoinableQueue, batch_size: int, zip_workers: int):
+    """
+    Repeatedly pull an extracted archive (func, taxa, aa, dna, tmpdir)
+    from *q* and run the original post‑processing pipeline.
+    """
+    while True:
+        item = q.get()
+        if item is None:       # sentinel → graceful shutdown
+            q.task_done()
+            break
+
+        func, taxa, aa, dna, tmp = item
+        try:
+            process_functional_profiles(Path(func))
+            process_gather_files(Path(func))
+            process_taxa_profiles(Path(taxa) if taxa else None)
+            process_signature_files(Path(aa)  if aa  else None,
+                                    "sigs_aa", batch_size, zip_workers)
+            process_signature_files(Path(dna) if dna else None,
+                                    "sigs_dna", batch_size, zip_workers)
+        except Exception as e:
+            logging.exception(f"Consumer failed on {tmp}: {e}")
+        finally:
+            if Config.CLEANUP_TEMP_FILES:
+                shutil.rmtree(tmp, ignore_errors=True)
+            q.task_done()
+
+# ═════════════════════════════════════════════════════════════════════
+# CLI / main
+# ═════════════════════════════════════════════════════════════════════
+def parse_args():
+    ap = argparse.ArgumentParser(
+        description="Logan archive → partitioned Parquet exporter (producer/consumer)")
+    ap.add_argument("--data-dir", default=Config.DATA_DIR,
+                    help="Directory with *.tar.gz archives")
+    ap.add_argument("--staging-dir", default=str(STAGING_ROOT),
+                    help="Output directory for Parquet shards")
+    ap.add_argument("--zip-workers", type=int, default=Config.MAX_WORKERS,
+                    help="ThreadPool workers for zip extraction (sig files)")
+    ap.add_argument("--batch-size", type=int, default=Config.BATCH_SIZE,
+                    help="Flush signature mins every N rows")
+    ap.add_argument("--producers", type=int, default=DEFAULT_PRODUCERS,
+                    help="Max concurrent archive extractions")
+    ap.add_argument("--consumers", type=int, default=DEFAULT_CONSUMERS,
+                    help="Number of consumer processes")
+    ap.add_argument("--buffer-size", type=int, default=DEFAULT_BUFFER,
+                    help="Bounded queue size (# extracted archives kept)")
+    ap.add_argument("--no-progress", action="store_true",
+                    help="Disable tqdm progress bars")
+    return ap.parse_args()
+
+def setup_logger():
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = Path("logs"); log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / f"export_to_parquet_{ts}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s %(processName)s  %(message)s",
+        handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stderr)]
+    )
+    logging.info(f"Log file: {log_file}")
+
+def main():
+    args = parse_args()
+
+    global STAGING_ROOT
+    STAGING_ROOT = Path(args.staging_dir).resolve()
+    STAGING_ROOT.mkdir(parents=True, exist_ok=True)
+    # make sure every fork/spawned process uses the same staging root
+    os.environ["STAGING_DIR"] = str(STAGING_ROOT)
+    setup_logger()
+
+    # ── discover & sort archives (small → large) ────────────────────
+    archives = sorted(Path(args.data_dir).glob("*.tar.gz"),
+                      key=lambda p: p.stat().st_size)
+    logging.info(f"{len(archives)} archives discovered in {args.data_dir}")
+
+    # ── queues & consumer pool ───────────────────────────────────────
+    dir_q = mp.JoinableQueue(maxsize=args.buffer_size)
+    consumers = [mp.Process(target=consumer_loop,
+                            args=(dir_q, args.batch_size, args.zip_workers),
+                            name=f"consume-{i}") for i in range(args.consumers)]
+    for p in consumers:
+        p.daemon = True
+        p.start()
+
+    # ── producer pool (extract tar.gz) ───────────────────────────────
+    with ProcessPoolExecutor(max_workers=args.producers) as ex:
+        fut_to_arch = {ex.submit(extract_nested_archives, str(a)): a
+                       for a in archives}
+
+        # push completed extractions to queue
+        for fut in tqdm(as_completed(fut_to_arch), total=len(fut_to_arch),
+                        desc="Extracting", disable=args.no_progress):
+            try:
+                res = fut.result()
+            except Exception as e:
+                logging.exception(f"Extraction failed: {e}")
+                continue
+            dir_q.put(res)      # blocks when buffer is full
+
+    # ── signal consumers & wait ──────────────────────────────────────
+    for _ in range(args.consumers):
+        dir_q.put(None)         # sentinel
+    dir_q.join()                # wait for queue to drain
+    for p in consumers:
+        p.join()
+
+    # ── one‑off tables (outside archives) ────────────────────────────
+    # add logging info that the taxonomy mapping is being processed
+    logging.info("Processing taxonomy mapping files...")
+    process_taxonomy_mapping(Path(args.data_dir))
+    logging.info("Processing geographical location data...")
+    process_geographical_location_data(Path(args.data_dir))
+    # turn this next line into a logging info message with timestamp
+    # print(f"\n🎉  Export finished. Parquet files are in {STAGING_ROOT}")
+    logging.info(f"🎉  Export finished. Parquet files are in {STAGING_ROOT}")
+
+if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)  # safe on Linux & macOS
+    main()
