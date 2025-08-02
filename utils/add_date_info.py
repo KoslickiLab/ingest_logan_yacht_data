@@ -24,12 +24,12 @@ def ensure_table(conn: duckdb.DuckDBPyConnection) -> None:
 
 def load_tsv_view(conn: duckdb.DuckDBPyConnection, tsv: pathlib.Path) -> None:
     """Expose the TSV as a temp view."""
-    conn.execute("""
+    conn.execute(f"""
         CREATE OR REPLACE TEMP VIEW tsv_raw AS
         SELECT  Accession AS accession,
                 CAST(Received AS TIMESTAMPTZ) AS received
-        FROM    read_csv_auto(?, delim='\t', header=true);
-    """, [str(tsv)])
+        FROM    read_csv_auto('{tsv}', delim='\t', header=true);
+    """)
 
 def bulk_insert(conn: duckdb.DuckDBPyConnection) -> None:
     """Insert only those accessions referenced by existing tables."""
