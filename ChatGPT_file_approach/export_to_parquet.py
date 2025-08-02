@@ -541,6 +541,9 @@ def parse_args():
                     help="Bounded queue size (# extracted archives kept)")
     ap.add_argument("--dash-off", dest="dash_off", action="store_true",
                     help="Disable live dashboard")
+    ap.add_argument("--skip-taxa-geo", dest="skip_taxa_geo", action="store_true",
+                    help="Skip the processing of taxonomy and geographical data")
+
     return ap.parse_args()
 
 
@@ -621,10 +624,11 @@ def main():
 
     # one‑off files (not inside each archive) ────────────────────────
     # add logging info that the taxonomy mapping is being processed
-    logging.info("Processing taxonomy mapping files...")
-    process_taxonomy_mapping(Path(args.data_dir))
-    logging.info("Processing geographical location data...")
-    process_geographical_location_data(Path(args.data_dir))
+    if not args.skip_taxa_geo:
+        logging.info("Processing taxonomy mapping files...")
+        process_taxonomy_mapping(Path(args.data_dir))
+        logging.info("Processing geographical location data...")
+        process_geographical_location_data(Path(args.data_dir))
 
     print(f"\n🎉  Export finished. Parquet files are in {STAGING_ROOT}")
 
