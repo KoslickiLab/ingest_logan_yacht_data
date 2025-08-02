@@ -381,7 +381,7 @@ def process_signature_files(sig_dir: Path,
 
     manifests, signatures, mins = [], [], []
 
-    with ProcessPoolExecutor(max_workers=procs) as pool:
+    with ThreadPoolExecutor(max_workers=procs) as pool:
         tasks = pool.map(_parse_zip_task,
                          ((str(z), sig_type) for z in zip_files))
         for m, s, mn in tqdm(tasks, total=len(zip_files),
