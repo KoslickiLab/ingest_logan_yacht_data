@@ -76,7 +76,7 @@ def main(argv: list[str] | None = None) -> None:
         conn.execute("ANALYZE sample_received;")  # fresh stats
         conn.execute("COMMIT;")
 
-    print("✅  sample_received populated and indexed (post‑load).")
+    print("✅  sample_received populated and indexed.")
 
 if __name__ == "__main__":
     main()
