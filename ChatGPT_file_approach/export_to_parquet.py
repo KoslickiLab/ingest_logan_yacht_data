@@ -111,7 +111,7 @@ def _dashboard(tracker: Progress,
                 f"Processing {proc} · "
                 f"Done {done} · "
                 f"Fail {failed} · "
-                f"{rate:5.2f} / s · ETA {eta}")
+                f"{rate:2.5f}/s · ETA {eta}")
         print(f"{clear}{line}", end="", flush=True)
         sleep(1 / refresh_hz)
     print()              # final newline when we exit
