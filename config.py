@@ -30,8 +30,8 @@ class Config:
     RETRAIN_THRESHOLD: int = int(os.getenv('RETRAIN_THRESHOLD', '1000'))
     
     DATA_DIR: str = os.getenv('DATA_DIR', './data')
-    BATCH_SIZE: int = int(os.getenv('BATCH_SIZE', '10000'))
-    MAX_WORKERS: int = int(os.getenv('MAX_WORKERS', '8'))
+    BATCH_SIZE: int = int(os.getenv('BATCH_SIZE', '100000000'))
+    MAX_WORKERS: int = int(os.getenv('MAX_WORKERS', '4'))  # zip workers in the current setup
     
     PROGRESS_BAR_ENABLED: bool = os.getenv('PROGRESS_BAR_ENABLED', 'true').lower() == 'true'
     

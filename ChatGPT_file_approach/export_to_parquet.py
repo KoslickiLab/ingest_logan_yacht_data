@@ -60,9 +60,9 @@ from config import Config                              # noqa: E402
 # ═════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ═════════════════════════════════════════════════════════════════════
-ROW_GROUP_SIZE    = 128 * 1024 * 1024        # 128 MiB
-DEFAULT_PRODUCERS = 16
-DEFAULT_CONSUMERS = max(1, os.cpu_count() // 2)
+ROW_GROUP_SIZE    = 128 * 1024 * 1024        # 128MiB
+DEFAULT_PRODUCERS = 10
+DEFAULT_CONSUMERS = 50
 DEFAULT_BUFFER    = 10
 
 STAGING_ROOT = Path(os.getenv("STAGING_DIR", "data_staging")).resolve()
