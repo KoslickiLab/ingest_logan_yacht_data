@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
-export_rarefaction.py  –  create a rarefaction‐curve dataset from DuckDB.
+export_rarefaction_fast.py  –  memory‑efficient rarefaction export with progress bar.
 
 Example
 -------
-python export_rarefaction.py \
-       --db   /path/to/my_database.duckdb \
-       --out  rarefaction_curve.csv
+python export_rarefaction_fast.py \
+       --db  /path/to/my_database.duckdb \
+       --out /scratch/rarefaction_curve.csv \
+       --threads 32 --mem 128GB
 """
 from __future__ import annotations
-import argparse, pathlib, sys, duckdb, pandas as pd
+import argparse, pathlib, sys, duckdb
 
-# --------------------------------------------------------------------------- #
 QUERY = r"""
 WITH first_seen AS (
-    -- Find the first calendar year in which each distinct min_hash appears
     SELECT
         sm.min_hash,
         MIN(EXTRACT(year FROM sr.date_received)) AS first_year
@@ -23,48 +22,58 @@ WITH first_seen AS (
       ON sr.sample_id = sm.sample_id
     GROUP BY sm.min_hash
 ),
-year_range AS (
-    -- Generate one row per year from the earliest to the latest observation
-    SELECT *
-    FROM range(
-        (SELECT MIN(first_year) FROM first_seen),          -- inclusive start
-        (SELECT MAX(first_year) FROM first_seen) + 1       -- exclusive stop
-    ) AS yrs(year)                                         -- yrs.year is INT
+new_per_year AS (
+    SELECT first_year AS year,
+           COUNT(*)   AS new_hashes
+    FROM   first_seen
+    GROUP  BY first_year
+),
+cumulative AS (
+    SELECT
+        year,
+        SUM(new_hashes)
+            OVER (ORDER BY year ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+            AS cumulative_hashes
+    FROM new_per_year
 )
-SELECT
-    yr.year                                            AS year,
-    (
-        SELECT COUNT(*)                                -- cumulative total
-        FROM first_seen f
-        WHERE f.first_year <= yr.year
-    ) AS cumulative_hashes
-FROM year_range AS yr
-ORDER BY yr.year;
+SELECT year, cumulative_hashes
+FROM   cumulative
+ORDER  BY year;
 """
 
-# --------------------------------------------------------------------------- #
-def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(description="Export rarefaction data to CSV.")
-    p.add_argument("--db",  required=True, type=pathlib.Path,
-                   help="Path to DuckDB database file.")
-    p.add_argument("--out", required=True, type=pathlib.Path,
-                   help="Output CSV path.")
-    args = p.parse_args(argv)
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Fast rarefaction export.")
+    ap.add_argument("--db",  required=True, type=pathlib.Path)
+    ap.add_argument("--out", required=True, type=pathlib.Path)
+    ap.add_argument("--threads", type=int, help="PRAGMA threads=N")
+    ap.add_argument("--mem", type=str, help="PRAGMA memory_limit='...'")
+    args = ap.parse_args()
 
     if not args.db.is_file():
-        sys.exit(f"Error: database not found → {args.db}")
+        sys.exit(f"DB not found → {args.db}")
 
-    # Run the query and fetch into a Pandas DataFrame
+    out_path = args.out.resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
     with duckdb.connect(str(args.db), read_only=True) as conn:
-        df: pd.DataFrame = conn.execute(QUERY).fetchdf()
+        # Resource knobs
+        if args.threads:
+            conn.execute(f"PRAGMA threads={args.threads};")
+        if args.mem:
+            conn.execute(f"PRAGMA memory_limit='{args.mem}';")
 
-    # Ensure the output directory exists, then write CSV
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(args.out, index=False)
+        # Progress bar (prints to stderr)
+        conn.execute("PRAGMA enable_progress_bar;")
 
-    print(f"✅  Rarefaction data written to {args.out} "
-          f"({len(df)} rows, {df['cumulative_hashes'].iloc[-1]:,} hashes).")
+        # Stream result directly to CSV
+        copy_sql = f"""
+            COPY ({QUERY})
+            TO '{out_path}'
+            (HEADER, DELIMITER ',');
+        """
+        conn.execute(copy_sql)
 
+    print(f"✅  Rarefaction exported → {out_path}")
 
-if __name__ == "__main__":   # pragma: no cover
+if __name__ == "__main__":
     main()
