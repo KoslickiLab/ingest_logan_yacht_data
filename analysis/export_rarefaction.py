@@ -69,6 +69,9 @@ def main() -> None:
 
         # Progress bar ------------------------------------------------------- #
         conn.execute("PRAGMA enable_progress_bar;")
+        conn.execute("SET enable_progress_bar = true;")
+        conn.execute("SET enable_progress_bar_print = true;")
+        conn.execute("SET progress_bar_time = 0;")
 
         # Escape the output path for SQL literal
         out_sql = str(out_path).replace("'", "''")
