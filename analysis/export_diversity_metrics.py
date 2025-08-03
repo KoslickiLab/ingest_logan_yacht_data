@@ -98,8 +98,8 @@ RAW_SQL = textwrap.dedent(r"""
                   / SUM(n_samples) OVER (ORDER BY year)
              ELSE 0 END AS cumulative_hashes_per_sample
     FROM joined
-    ORDER BY year;
-""").strip()   # ← NO trailing semicolon
+    ORDER BY year
+""").strip()
 
 # ──────────────────────────────────────────────────────────────────────────────
 def main() -> None:
