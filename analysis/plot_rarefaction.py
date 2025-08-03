@@ -20,12 +20,11 @@ import pathlib
 import pandas as pd
 import matplotlib.pyplot as plt
 
-
 # --------------------------------------------------------------------------- #
 # Constants describing the sketch
 HASH_BITS = 64
-SCALE     = 1_000                      # FracMinHash `--scale` used
-HASH_SPACE = math.ceil(2 ** HASH_BITS / SCALE)   # total distinct hashes possible
+SCALE = 1_000  # FracMinHash `--scale` used
+HASH_SPACE = math.ceil(2 ** HASH_BITS / SCALE)  # total distinct hashes possible
 
 
 # --------------------------------------------------------------------------- #
@@ -33,8 +32,8 @@ def make_plot(df: pd.DataFrame, outfile_prefix: pathlib.Path) -> None:
     """Draw the figure and save to PDF/PNG."""
     # Matplotlib 'Nature‐ish' typography & layout
     plt.rcParams.update({
-        "font.family":    "serif",
-        "font.size":      7,
+        "font.family": "serif",
+        "font.size": 7,
         "axes.linewidth": 0.6,
         "xtick.direction": "in",
         "ytick.direction": "in",
@@ -45,7 +44,8 @@ def make_plot(df: pd.DataFrame, outfile_prefix: pathlib.Path) -> None:
         "grid.linewidth": 0.3,
     })
 
-    fig, ax_left = plt.subplots(figsize=(3.14, 2.5))   # ~80 mm wide
+    # Increased figure height to accommodate legend outside plot area
+    fig, ax_left = plt.subplots(figsize=(3.14, 3.0))  # ~80 mm wide, taller
 
     # Left axis: cumulative hashes (log10 scale)
     ax_left.plot(
@@ -55,19 +55,19 @@ def make_plot(df: pd.DataFrame, outfile_prefix: pathlib.Path) -> None:
     ax_left.set_yscale("log")
     ax_left.set_xlabel("Year")
     ax_left.set_ylabel("Cumulative distinct hashes")
-    ax_left.margins(x=0.03)               # small breathing room
+    ax_left.margins(x=0.03)  # small breathing room
     ax_left.grid(axis="y", which="major", linestyle=":", alpha=0.6)
 
     # Right axis: fraction of hash space (%)
     ax_right = ax_left.twinx()
-    frac = df["cumulative_hashes"] / HASH_SPACE * 100   # percent
+    frac = df["cumulative_hashes"] / HASH_SPACE * 100  # percent
     ax_right.plot(
         df["year"], frac,
         marker="s", linewidth=1, markersize=3, linestyle="--",
         label="Hash space sampled"
     )
     ax_right.set_ylabel("Hash space covered (%)")
-    ax_right.set_ylim(0, frac.max() * 1.15)             # headroom
+    ax_right.set_ylim(0, frac.max() * 1.15)  # headroom
 
     # Unified legend (handles from both axes)
     handles, labels = [], []
@@ -75,9 +75,14 @@ def make_plot(df: pd.DataFrame, outfile_prefix: pathlib.Path) -> None:
         h, l = ax.get_legend_handles_labels()
         handles.extend(h)
         labels.extend(l)
-    fig.legend(handles, labels, loc="upper left", fontsize=6, frameon=False)
 
-    fig.tight_layout(pad=0.5)
+    # Position legend outside the plot area at the top
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.95),
+               fontsize=6, frameon=False, ncol=2)
+
+    # Adjust layout to make room for the legend
+    fig.tight_layout(rect=[0, 0, 1, 0.9])
+
     for ext in (".pdf", ".png"):
         fig.savefig(outfile_prefix.with_suffix(ext), dpi=600 if ext == ".png" else None)
     plt.close(fig)
