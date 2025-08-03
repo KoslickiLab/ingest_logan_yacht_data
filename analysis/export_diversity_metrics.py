@@ -123,6 +123,9 @@ def main() -> None:
             conn.execute(f"PRAGMA memory_limit='{args.mem}';")
 
         conn.execute("PRAGMA enable_progress_bar;")
+        conn.execute("SET enable_progress_bar = true;")
+        conn.execute("SET enable_progress_bar_print = true;")
+        conn.execute("SET progress_bar_time = 0;")
 
         # Escape path for SQL literal
         out_literal = str(out_path).replace("'", "''")
