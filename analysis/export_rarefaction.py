@@ -56,7 +56,10 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with duckdb.connect(str(args.db), read_only=True) as conn:
-        # Resource knobs
+        #Resource knobs
+        # set temp directory to /scratch/tmp
+        conn.execute("SET temp_directory='/scratch/tmp'")
+
         if args.threads:
             conn.execute(f"PRAGMA threads={args.threads};")
         if args.mem:
