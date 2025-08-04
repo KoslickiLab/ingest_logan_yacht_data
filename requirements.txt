@@ -6,6 +6,7 @@ openai
 openpyxl
 pyarrow
 humanize
+pyroaring
 
 # Testing dependencies
 pytest>=7.0.0
