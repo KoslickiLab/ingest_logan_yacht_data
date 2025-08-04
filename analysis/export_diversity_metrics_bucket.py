@@ -142,7 +142,7 @@ def main() -> None:
     )
     ap.add_argument("--db", required=True, type=pathlib.Path)
     ap.add_argument("--out", required=True, type=pathlib.Path)
-    ap.add_argument("--buckets", type=int, default=256, help="Power‑of‑two bucket count")
+    ap.add_argument("--buckets", type=int, default=256, help="Power-of-two bucket count")
     ap.add_argument("--threads", type=int, help="DuckDB PRAGMA threads")
     ap.add_argument("--mem", type=str, help="DuckDB PRAGMA memory_limit")
     args = ap.parse_args()
