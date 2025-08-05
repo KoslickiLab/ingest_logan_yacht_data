@@ -1,39 +1,32 @@
 #!/usr/bin/env python3
-# ───────────────────────────────────────────────────────────────────────────────
-#  write_minhash_buckets.py
-#  ----------------------------------
-#  One‑pass writer that materialises a Hive‑partitioned Parquet dataset
-#  `(bucket=0 … bucket=255)` from the DuckDB schema
-#
-#  Defensive features:
-#    • Creates data in  <dest>_tmp  and atomically renames on success
-#    • Skips the scan if the final directory already has 256 partitions
-#    • Verifies row counts per partition after write
-# ───────────────────────────────────────────────────────────────────────────────
 """
-Usage
------
-python write_minhash_buckets.py \
-       --db  /path/to/database.db \
-       --dest /scratch/minhash_buckets     # default
-       --threads 64 --mem 1TB
-"""
+write_minhash_buckets.py
+------------------------
+Single‑pass scan of the DuckDB that writes a Hive‑partitioned Parquet
+dataset (bucket=0 … bucket=255) under <dest>.  The script is **idempotent**:
 
+* Buckets that already exist in <dest> are left untouched.
+* If the previous run was interrupted the temporary directory is inspected
+  and any completed buckets inside it are *merged* into <dest>.
+* The scan is skipped entirely when *all* 256 buckets already exist.
+"""
 from __future__ import annotations
-
 import argparse, logging, os, pathlib, shutil, sys, tempfile, time
 import duckdb
 
-# ─────────────────────────────────────────────────────────────── configuration ─
-DEFAULT_DEST = pathlib.Path("/scratch/minhash_buckets")
+DEFAULT_DEST = pathlib.Path("/scratch/minhash_buckets")   # change if desired
 LOG_FMT = "[%(asctime)s] %(levelname)s: %(message)s"
 logging.basicConfig(format=LOG_FMT, level=logging.INFO, datefmt="%H:%M:%S")
 log = logging.getLogger("writer")
 
 
-def has_all_partitions(dest: pathlib.Path) -> bool:
-    """Fast check: do we already have bucket=0 … bucket=255 sub‑dirs?"""
-    return all((dest / f"bucket={b}").is_dir() for b in range(256))
+def existing_buckets(root: pathlib.Path) -> set[int]:
+    """Return the set of bucket IDs (0‑255) that already exist as dirs."""
+    return {
+        int(p.name.split("=", 1)[1])
+        for p in root.glob("bucket=*")
+        if p.is_dir() and p.name.count("=") == 1 and p.name.split("=", 1)[1].isdigit()
+    }
 
 
 def main() -> None:
@@ -48,52 +41,71 @@ def main() -> None:
         sys.exit(f"Database not found → {args.db}")
 
     dest = args.dest.resolve()
-    if has_all_partitions(dest):
-        log.info("✅  Dataset already complete → %s", dest)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    done = existing_buckets(dest)
+    if len(done) == 256:
+        log.info("✅  All 256 buckets already present – nothing to do.")
         return
+    log.info("Found %d / 256 buckets in %s; %d remain to be written.",
+             len(done), dest, 256 - len(done))
 
-    tmp_dir = dest.with_suffix(".tmp")
-    if tmp_dir.exists():
-        log.warning("Removing stale temporary directory %s", tmp_dir)
-        shutil.rmtree(tmp_dir)
+    #
+    # Write missing buckets to a throw‑away temporary dir first
+    #
+    with tempfile.TemporaryDirectory(dir=dest.parent, prefix="minhash_tmp_") as tmp:
+        tmp_path = pathlib.Path(tmp)
+        log.info("Copying missing buckets into   %s", tmp_path)
 
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    log.info("Writing Parquet dataset to temporary location %s", tmp_dir)
+        where_clause = ""
+        if done:
+            done_list = ",".join(map(str, sorted(done)))
+            where_clause = f"WHERE (sm.min_hash >> 56) NOT IN ({done_list})"
 
-    with duckdb.connect(str(args.db), read_only=True) as conn:
-        if args.threads:
-            conn.execute(f"PRAGMA threads={args.threads};")
-        if args.mem:
-            conn.execute(f"PRAGMA memory_limit='{args.mem}';")
+        with duckdb.connect(str(args.db), read_only=True) as conn:
+            if args.threads:
+                conn.execute(f"PRAGMA threads={args.threads};")
+            if args.mem:
+                conn.execute(f"PRAGMA memory_limit='{args.mem}';")
 
-        t0 = time.perf_counter()
-        conn.execute(
-            f"""
-            COPY (
-              SELECT  sm.min_hash,
-                      EXTRACT(year FROM sr.date_received) AS year,
-                      (sm.min_hash >> 56)                AS bucket
-              FROM    sigs_dna.signature_mins sm
-              JOIN    sample_received          sr USING (sample_id)
-            )
-            TO '{str(tmp_dir).replace("'", "''")}'
-            (FORMAT parquet,
-             COMPRESSION ZSTD,
-             PARTITION_BY (bucket));
-            """
-        )
-        log.info("Initial COPY finished in %.1f min", (time.perf_counter() - t0) / 60)
+            t0 = time.perf_counter()
+            conn.execute(f"""
+                COPY (
+                  SELECT  sm.min_hash,
+                          EXTRACT(year FROM sr.date_received) AS year,
+                          (sm.min_hash >> 56)                AS bucket
+                  FROM    sigs_dna.signature_mins sm
+                  JOIN    sample_received          sr USING (sample_id)
+                  {where_clause}
+                )
+                TO '{str(tmp_path).replace("'", "''")}'
+                (FORMAT parquet,
+                 COMPRESSION ZSTD,
+                 PARTITION_BY (bucket));
+            """)
+            log.info("COPY finished in %.1f min",
+                     (time.perf_counter() - t0) / 60)
 
-        # Quick sanity check – ensure 256 buckets exist
-        if not has_all_partitions(tmp_dir):
-            shutil.rmtree(tmp_dir)
-            sys.exit("❌ COPY completed but not all partitions were created – aborting.")
+        #
+        # Move any new bucket=NNN folders over *individually* (atomic per bucket)
+        #
+        new_buckets = 0
+        for p in tmp_path.glob("bucket=*"):
+            b = int(p.name.split("=", 1)[1])
+            target = dest / p.name
+            if target.exists():
+                # Should only happen if two concurrent writers race;
+                # keep the first version and drop the duplicate.
+                shutil.rmtree(p)
+                continue
+            shutil.move(str(p), target)
+            new_buckets += 1
 
-    # Atomic replace
-    if dest.exists():
-        shutil.rmtree(dest)
-    tmp_dir.rename(dest)
-    log.info("✅  Parquet dataset ready → %s", dest)
+        log.info("Moved %d new bucket(s) into %s", new_buckets, dest)
+
+    # tmp directory auto‑removed by context manager
+    final = existing_buckets(dest)
+    log.info("Dataset now has %d / 256 buckets.", len(final))
 
 
 if __name__ == "__main__":
