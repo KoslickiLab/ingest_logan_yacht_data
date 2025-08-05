@@ -32,6 +32,7 @@ def existing_buckets(root: pathlib.Path) -> set[int]:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Materialise min_hash Parquet buckets.")
     ap.add_argument("--db", required=True, type=pathlib.Path)
+    ap.add_argument("--ksize", type=int, default=31, help = "k‑mer size to export (default: 31)")
     ap.add_argument("--dest", type=pathlib.Path, default=DEFAULT_DEST)
     ap.add_argument("--threads", type=int, help="DuckDB PRAGMA threads")
     ap.add_argument("--mem", type=str, help="DuckDB PRAGMA memory_limit")
@@ -57,10 +58,11 @@ def main() -> None:
         tmp_path = pathlib.Path(tmp)
         log.info("Copying missing buckets into   %s", tmp_path)
 
-        where_clause = ""
+        conditions = [f"sm.ksize = {args.ksize}"]
         if done:
             done_list = ",".join(map(str, sorted(done)))
-            where_clause = f"WHERE (sm.min_hash >> 56) NOT IN ({done_list})"
+            conditions.append(f"(sm.min_hash >> 56) NOT IN ({done_list})")
+        where_clause = "WHERE " + " AND ".join(conditions)
 
         with duckdb.connect(str(args.db), read_only=True) as conn:
             if args.threads:
