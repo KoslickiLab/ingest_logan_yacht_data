@@ -52,7 +52,7 @@ def ensure_counts(conn: duckdb.DuckDBPyConnection, bucket_dir: pathlib.Path) -> 
                COUNT(*)   AS cnt
         FROM first_seen
         GROUP BY first_year
-        ORDER BY year;
+        ORDER BY year
     """
     conn.execute(
         f"""
