@@ -28,7 +28,7 @@ class FunctionalProfileVanna:
         
         self.ai_provider = create_ai_provider(config)
         
-        self.conn = duckdb.connect(self.db_path)
+        self.conn = duckdb.connect(self.db_path, read_only=True)
         
         logger.info(f"Initialized AI assistant with provider: {config.LLM_PROVIDER}")
     
