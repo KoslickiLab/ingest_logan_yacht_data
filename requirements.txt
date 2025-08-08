@@ -4,6 +4,9 @@ tqdm~=4.67.1
 vanna[chromadb, openai]
 openai
 openpyxl
+pyarrow
+humanize
+pyroaring
 
 # Testing dependencies
 pytest>=7.0.0
