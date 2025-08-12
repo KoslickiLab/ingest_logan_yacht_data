@@ -11,6 +11,8 @@ Changes vs. the earlier version
 * On restart we **reuse** those files instead of reading the big Parquet
   data again.
 * The old bucket_progress.json mechanism is gone—no risk of “all zeros”.
+
+WARNING: If you parquet file is large, DuckDB will dump a lot of data to disc. Eg. ~8TB when operating on a 1.3 TB parquet file.
 """
 from __future__ import annotations
 import argparse, collections, csv, logging, pathlib, sys, time, duckdb
