@@ -31,9 +31,12 @@ pip install -r requirements.txt
 
 ### Step 1: Convert Archives to Parquet
 
-Process Logan archives containing metagenomic analysis results:
+Prep the geo data, and process Logan archives containing metagenomic analysis results:
 
 ```bash
+# Add geographical data
+python utils/merge_geo.py  # The Logan-provided geographic location data doesn't use sample_ids, but we can connect them via Bio Sample using the SRA's own metadata
+
 python utils/export_to_parquet.py \
     --data-dir /path/to/archives \
     --staging-dir /scratch/parquet_staging \
@@ -65,12 +68,9 @@ Add the `--fast` flag to skip slow indexing steps during testing.
 
 ### Step 3: Add Metadata (Optional)
 
-Merge geographical and temporal metadata:
+Add the temporal metadata:
 
 ```bash
-# Add geographical data
-python utils/merge_geo.py  # Processes data/ directory
-
 # Add sample dates
 python utils/add_date_info.py \
     --db logan.db \
@@ -175,3 +175,4 @@ Key tables and their purposes:
 ## Citation
 
 If you use this system in your research, please cite [appropriate paper/DOI].
+
