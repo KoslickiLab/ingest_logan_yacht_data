@@ -53,6 +53,8 @@ This extracts:
 
 **Note**: For very large datasets, use `utils/process_tar_gz_file.py` with GNU parallel for better memory control.
 
+**Note**: These were obtained from Rayan Chiki and reside on the Koslicki Lab GPU server at: `/scratch/shared_data_new/Logan_yacht_data/raw_downloads`. The data was obtained via: `aws s3 sync s3://serratus-rayan/beetles/logan_feb12_run/yacht-concat/ .`
+
 ### Step 2: Create DuckDB Database
 
 Import Parquet files and build indexes:
@@ -175,4 +177,5 @@ Key tables and their purposes:
 ## Citation
 
 If you use this system in your research, please cite [appropriate paper/DOI].
+
 
