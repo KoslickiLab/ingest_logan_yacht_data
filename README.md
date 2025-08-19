@@ -51,8 +51,6 @@ This extracts:
 - Sourmash signatures (DNA/protein min-hashes)
 - Gather results (sequence similarity)
 
-**Note**: For very large datasets, use `utils/process_tar_gz_file.py` with GNU parallel for better memory control.
-
 **Internal Note**: The archive resides on the Koslicki Lab GPU server at: `/scratch/shared_data_new/Logan_yacht_data/raw_downloads`. 
 
 ### Step 2: Create DuckDB Database
@@ -177,6 +175,7 @@ Key tables and their purposes:
 ## Citation
 
 If you use this system in your research, please cite [appropriate paper/DOI].
+
 
 
 
