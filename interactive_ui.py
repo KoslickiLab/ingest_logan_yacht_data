@@ -32,48 +32,61 @@ class InteractiveUI:
                 
                 if question.lower() == 'retrain':
                     print("🔄 Retraining AI model with latest data...")
-                    self.ai_assistant.setup_training_data(force_retrain=True)
-                    print("✅ Retraining complete!")
+                    try:
+                        self.ai_assistant.setup_training_data(force_retrain=True)
+                        print("✅ Retraining complete!")
+                    except Exception as e:
+                        print(f"❌ Retraining failed: {e}")
                     continue
                 
                 if not question:
                     continue
                 
                 print("\n🔍 Processing your question...")
-                result = self.ai_assistant.ask_question(question)
-                
-                if result['success']:
-                    print(f"\n📝 Generated SQL:")
-                    print(f"```sql\n{result['sql']}\n```")
+                try:
+                    result = self.ai_assistant.ask_question(question)
                     
-                    print(f"\n📊 Results:")
-                    if len(result['results']) > 0:
-                        display_df = result['results'].head(20)
-                        print(display_df.to_string(index=False))
-                        if len(result['results']) > 20:
-                            print(f"\n... and {len(result['results']) - 20} more rows")
+                    if result['success']:
+                        print(f"\n📝 Generated SQL:")
+                        print(f"```sql\n{result['sql']}\n```")
+                        
+                        print(f"\n📊 Results:")
+                        if len(result['results']) > 0:
+                            display_df = result['results'].head(20)
+                            print(display_df.to_string(index=False))
+                            if len(result['results']) > 20:
+                                print(f"\n... and {len(result['results']) - 20} more rows")
+                        else:
+                            print("No results found.")
+                        
+                        # Generate AI response based on the results
+                        print("\n🤖 AI Analysis:")
+                        ai_response = self._generate_ai_response(question, result['results'])
+                        print(ai_response)
+                        
+                        if 'explanation' in result and result['explanation']:
+                            print(f"\n💡 Technical Explanation:")
+                            print(result['explanation'])
                     else:
-                        print("No results found.")
+                        print(f"\n❌ Error: {result['error']}")
+                        print("💡 Try rephrasing your question or use 'help' for examples.")
                     
-                    # Generate AI response based on the results
-                    print("\n🤖 AI Analysis:")
-                    ai_response = self._generate_ai_response(question, result['results'])
-                    print(ai_response)
+                    print("\n" + "="*80 + "\n")
                     
-                    if 'explanation' in result and result['explanation']:
-                        print(f"\n💡 Technical Explanation:")
-                        print(result['explanation'])
-                else:
-                    print(f"\n❌ Error: {result['error']}")
+                except Exception as e:
+                    print(f"\n❌ Error processing question: {str(e)}")
                     print("💡 Try rephrasing your question or use 'help' for examples.")
-                
-                print("\n" + "="*80 + "\n")
+                    print("\n" + "="*80 + "\n")
                 
             except KeyboardInterrupt:
                 print("\nGoodbye!")
                 break
+            except EOFError:
+                print("\nGoodbye!")
+                break
             except Exception as e:
-                print(f"Error: {str(e)}")
+                print(f"Unexpected error: {str(e)}")
+                print("Please try again or type 'quit' to exit.")
     
     def _show_examples(self):
         """Show example questions"""

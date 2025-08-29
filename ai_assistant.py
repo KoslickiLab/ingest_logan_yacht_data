@@ -2,6 +2,7 @@ import os
 import duckdb
 import pandas as pd
 import logging
+from typing import Dict, Any, Optional, List
 from tqdm import tqdm
 from db_schema import get_database_schema, get_sample_queries, get_database_documentation
 from config import Config
@@ -16,19 +17,56 @@ class FunctionalProfileVanna:
         
         Args:
             db_path (str): Path to the DuckDB database (uses Config.DATABASE_PATH if None)
-            ai_config (dict): AI configuration (uses Config.get_ai_config() if None)
+            config (Config): Configuration object
         """
+        if config is None:
+            raise ValueError("Config object is required")
+        
+        # Validate configuration
+        try:
+            config.validate()
+        except ValueError as e:
+            logger.error(f"Configuration validation failed: {e}")
+            raise
+        
         self.db_path = db_path or config.DATABASE_PATH
         self.retrain_threshold = config.RETRAIN_THRESHOLD
         self.progress_bar = config.PROGRESS_BAR_ENABLED
         self.max_results = config.MAX_QUERY_RESULTS
+        self.config = config
         
+        # Validate database exists
         if not os.path.exists(self.db_path):
-            raise FileNotFoundError(f"Database {self.db_path} not found! Please run process_functional_profiles.py first.")
+            raise FileNotFoundError(
+                f"Database {self.db_path} not found! "
+                "Please run the data processing pipeline first to create the database."
+            )
         
-        self.ai_provider = create_ai_provider(config)
+        # Initialize AI provider
+        try:
+            self.ai_provider = create_ai_provider(config)
+        except Exception as e:
+            logger.error(f"Failed to create AI provider: {e}")
+            raise RuntimeError(f"AI provider initialization failed: {e}")
         
-        self.conn = duckdb.connect(self.db_path, read_only=True)
+        # Initialize database connection
+        try:
+            self.conn = duckdb.connect(self.db_path, read_only=True)
+        except Exception as e:
+            logger.error(f"Failed to connect to database: {e}")
+            raise RuntimeError(f"Database connection failed: {e}")
+    
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - cleanup resources"""
+        if hasattr(self, 'conn') and self.conn:
+            try:
+                self.conn.close()
+            except Exception as e:
+                logger.warning(f"Error closing database connection: {e}")
         
         logger.info(f"Initialized AI assistant with provider: {config.LLM_PROVIDER}")
     
@@ -44,19 +82,36 @@ class FunctionalProfileVanna:
                     logger.info(f"Found {len(existing_data)} existing training examples. Skipping retrain.")
                     print(f"✅ Found {len(existing_data)} existing training examples. Skipping retrain.")
                     return
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Could not check existing training data: {e}")
+                print("⚠️ Could not check existing training data, proceeding with training...")
         
         print("📚 Training AI model with database schema and examples...")
         
-        self._connect_ai_to_database()
+        try:
+            self._connect_ai_to_database()
+        except Exception as e:
+            logger.warning(f"Could not connect AI to database: {e}")
         
-        self._auto_train_from_information_schema()
+        try:
+            self._auto_train_from_information_schema()
+        except Exception as e:
+            logger.error(f"Auto-training from information schema failed: {e}")
+            print("⚠️ Auto-training failed, using fallback method...")
+            self._fallback_schema_training()
         
-        self._train_with_domain_knowledge()
+        try:
+            self._train_with_domain_knowledge()
+        except Exception as e:
+            logger.error(f"Domain knowledge training failed: {e}")
+            print("⚠️ Domain knowledge training failed")
         
-        print("💡 Adding sample SQL queries...")
-        self._train_with_sample_queries()
+        try:
+            print("💡 Adding sample SQL queries...")
+            self._train_with_sample_queries()
+        except Exception as e:
+            logger.error(f"Sample query training failed: {e}")
+            print("⚠️ Sample query training failed")
         
         logger.info("Training data setup complete!")
         print("✅ Training data setup complete!")
@@ -169,32 +224,52 @@ class FunctionalProfileVanna:
         metagenomic_docs = """
         METAGENOMIC DATABASE KNOWLEDGE:
         
-        This database contains metagenomic analysis results with key concepts:
+        This database contains comprehensive metagenomic analysis results with key concepts:
         
         SCHEMAS AND DATA TYPES:
         - functional_profile: KEGG Orthology (KO) functional annotations with abundance data (unified table)
         - taxa_profiles: Taxonomic classifications with confidence scores and organism identification
         - functional_profile_data: Sourmash gather results with sequence similarity metrics
         - sigs_aa/sigs_dna: Protein and DNA signature data with min-hash values
-        - signature_mins_sigs_aa/signature_mins_sigs_dna: Individual hash values for each sample's signatures
+        - geographical_location_data: Sample metadata including location, biome, and source information
+        - sample_received: Temporal metadata for sample collection and processing dates
         
         SAMPLE IDENTIFICATION:
         - Sample IDs follow pattern DRR****** (DRR + 6 digits, e.g., DRR012227, DRR000001)  
-        - functional_profile.profiles has sample_id column linking all data
-        - Other schemas have sample-specific tables named by sample_id
+        - All major tables have sample_id column for easy cross-table analysis
+        - Unified schema design enables complex multi-dimensional queries
         
-        KEY METRICS:
-        - KO abundance: Quantitative functional gene family abundance
-        - max_containment: Sequence similarity containment score (0-1)
-        - f_query_match: Fraction of query sequence matched (0-1)
-        - average_containment_ani: Average nucleotide identity based on containment  
-        - actual_confidence_with_coverage: Taxonomic confidence with coverage correction
+        KEY METRICS AND CONCEPTS:
+        - KO abundance: Quantitative functional gene family abundance (KEGG Orthology)
+        - max_containment: Sequence similarity containment score (0-1, higher = more similar)
+        - f_query_match: Fraction of query sequence matched (0-1, coverage metric)
+        - average_containment_ani: Average nucleotide identity based on containment (0-100)
+        - actual_confidence_with_coverage: Taxonomic confidence with coverage correction (0-1)
         - in_sample_est: Boolean estimate if organism is present in sample
+        - jaccard: Jaccard similarity index for sequence comparison
+        - intersect_bp: Base pairs of intersection between query and reference
         
         ORGANISM IDENTIFICATION:
         - organism_name: Full organism name from reference database
         - organism_id: Extracted NCBI accession (GCA_/GCF_) identifier
-        - KO IDs format: 'ko:K00001', etc.
+        - tax_id: NCBI taxonomy ID (-1 if not mapped)
+        - KO IDs format: 'ko:K00001', etc. (KEGG Orthology identifiers)
+        
+        GEOGRAPHICAL AND TEMPORAL DATA:
+        - country: Sample collection country
+        - biome: Ecological biome classification
+        - lat_lon: Geographic coordinates (when available)
+        - isolation_source: Source of sample isolation
+        - date_received: When sample was received for processing
+        - year_received: Year for temporal analysis
+        
+        ANALYSIS CAPABILITIES:
+        - Functional analysis: KEGG pathway and gene family analysis
+        - Taxonomic analysis: Organism identification and classification
+        - Sequence similarity: Min-hash based sequence comparison
+        - Geographical analysis: Spatial distribution of samples
+        - Temporal analysis: Time-based trends and patterns
+        - Multi-dimensional analysis: Combine all data types for comprehensive insights
         """
         
         self.ai_provider.train(documentation=metagenomic_docs)
@@ -363,6 +438,39 @@ class FunctionalProfileVanna:
                 abundance INTEGER,              -- Abundance for this hash (1 if no abundance data)
                 position INTEGER                -- Position index in signature
             );
+            """,
+
+            """
+            -- Geographical location data table
+            CREATE TABLE geographical_location_data.locations (
+                sample_id VARCHAR,              -- Sample identifier (DRR******)
+                accession VARCHAR,              -- SRA accession number
+                country VARCHAR,                -- Country name
+                biome VARCHAR,                  -- Biome classification
+                lat_lon VARCHAR,                -- Latitude/longitude coordinates
+                elevation VARCHAR,              -- Elevation data
+                collection_date VARCHAR,        -- Sample collection date
+                isolation_source VARCHAR,       -- Source of isolation
+                host VARCHAR,                   -- Host organism (if applicable)
+                strain VARCHAR,                 -- Strain information
+                serotype VARCHAR,               -- Serotype information
+                isolation_source_host_associated VARCHAR, -- Host association
+                isolation_source_environmental VARCHAR,   -- Environmental source
+                isolation_source_clinical VARCHAR,        -- Clinical source
+                isolation_source_engineered VARCHAR,      -- Engineered source
+                isolation_source_other VARCHAR             -- Other sources
+            );
+            """,
+
+            """
+            -- Sample temporal metadata table
+            CREATE TABLE sample_received (
+                sample_id VARCHAR,              -- Sample identifier (DRR******)
+                date_received DATE,             -- Date sample was received
+                year_received INTEGER,          -- Year sample was received
+                month_received INTEGER,         -- Month sample was received
+                day_received INTEGER            -- Day sample was received
+            );
             """
         ]
         
@@ -378,6 +486,7 @@ class FunctionalProfileVanna:
         - Access pattern: SELECT ko_id, abundance FROM functional_profile.profiles WHERE sample_id = 'DRR012227'
         - Filter by sample: WHERE sample_id = 'sample_name'
         - Aggregate across samples: GROUP BY sample_id or GROUP BY ko_id
+        - KO analysis: GROUP BY ko_id for functional pathway analysis
         
         TAXA PROFILES:
         - Schema: taxa_profiles  
@@ -385,6 +494,8 @@ class FunctionalProfileVanna:
         - Access pattern: SELECT organism_name, tax_id, actual_confidence_with_coverage FROM taxa_profiles.profiles WHERE sample_id = 'DRR012227'
         - Filter by sample: WHERE sample_id = 'sample_name'
         - Filter by taxonomy: WHERE tax_id = specific_id OR WHERE tax_id != -1 (for mapped organisms)
+        - Filter by confidence: WHERE actual_confidence_with_coverage > 0.8
+        - Filter by presence: WHERE in_sample_est = true
         - Cross-sample analysis: GROUP BY sample_id
         - Organism analysis: GROUP BY organism_name, organism_id, tax_id
         - Taxonomy analysis: GROUP BY tax_id for phylogenetic studies
@@ -400,16 +511,24 @@ class FunctionalProfileVanna:
         - Schema: functional_profile_data
         - Table: gather_data (contains all samples)
         - Access pattern: SELECT * FROM functional_profile_data.gather_data WHERE sample_id = 'DRR012227'
+        - Sequence similarity: WHERE max_containment > 0.8
+        - Coverage analysis: WHERE f_query_match > 0.5
+        - ANI analysis: WHERE average_containment_ani > 95
+        - Quality filtering: WHERE potential_false_negative = false
         
         SIGNATURE MANIFESTS:
         - Schemas: sigs_aa, sigs_dna
         - Tables: manifests (contains all samples)
         - Access pattern: SELECT * FROM sigs_aa.manifests WHERE sample_id = 'DRR012227'
+        - K-mer size analysis: GROUP BY ksize
+        - Abundance analysis: WHERE with_abundance = true
         
         SIGNATURE METADATA:
         - Schemas: sigs_aa, sigs_dna
         - Tables: signatures (contains all samples)
         - Access pattern: SELECT * FROM sigs_aa.signatures WHERE sample_id = 'DRR012227'
+        - Hash count analysis: GROUP BY num_mins
+        - Signature size analysis: GROUP BY signature_size
         
         SIGNATURE MIN-HASH VALUES:
         - Schemas: sigs_aa, sigs_dna
@@ -418,6 +537,23 @@ class FunctionalProfileVanna:
         - Filter by sample: WHERE sample_id = 'sample_name'
         - Cross-sample analysis: GROUP BY sample_id
         - Hash overlap analysis: JOIN on min_hash between samples
+        - Abundance analysis: GROUP BY abundance
+        
+        GEOGRAPHICAL DATA:
+        - Schema: geographical_location_data
+        - Table: locations (contains all samples)
+        - Access pattern: SELECT * FROM geographical_location_data.locations WHERE sample_id = 'DRR012227'
+        - Country analysis: GROUP BY country
+        - Biome analysis: GROUP BY biome
+        - Spatial analysis: WHERE lat_lon IS NOT NULL
+        - Source analysis: GROUP BY isolation_source
+        
+        TEMPORAL DATA:
+        - Table: sample_received (contains all samples)
+        - Access pattern: SELECT * FROM sample_received WHERE sample_id = 'DRR012227'
+        - Year analysis: GROUP BY year_received
+        - Temporal trends: ORDER BY date_received
+        - Time-based filtering: WHERE date_received BETWEEN '2020-01-01' AND '2020-12-31'
         
         UNIFIED TABLE QUERY PATTERNS:
         - All major tables now have sample_id column for easy filtering and joining
@@ -429,6 +565,9 @@ class FunctionalProfileVanna:
         - Organism analysis: GROUP BY organism_name, organism_id across all samples
         - Functional analysis: GROUP BY ko_id across all samples
         - Taxonomic analysis: GROUP BY tax_id for phylogenetic studies
+        - Geographical analysis: JOIN with geographical_location_data.locations
+        - Temporal analysis: JOIN with sample_received
+        - Multi-dimensional analysis: Combine functional, taxonomic, geographical, and temporal data
         """
         
         self.ai_provider.train(documentation=additional_docs)
@@ -443,7 +582,7 @@ class FunctionalProfileVanna:
             query_progress.set_postfix(query=description[:50] + "...")
             self.ai_provider.add_question_sql(question=description, sql=sql)
     
-    def ask_question(self, question):
+    def ask_question(self, question: str) -> Dict[str, Any]:
         """
         Ask a natural language question about the database
         
@@ -453,6 +592,9 @@ class FunctionalProfileVanna:
         Returns:
             dict: Contains SQL query, results, and explanation
         """
+        import time
+        start_time = time.time()
+        
         try:
             logger.info(f"Processing question: {question}")
             
@@ -474,20 +616,26 @@ class FunctionalProfileVanna:
             
             explanation = self._generate_simple_explanation(sql, df)
             
+            processing_time = time.time() - start_time
+            logger.info(f"Question processed in {processing_time:.2f} seconds")
+            
             return {
                 'question': question,
                 'sql': sql,
                 'results': df,
                 'explanation': explanation,
-                'success': True
+                'success': True,
+                'processing_time': processing_time
             }
             
         except Exception as e:
-            logger.error(f"Error processing question: {str(e)}")
+            processing_time = time.time() - start_time
+            logger.error(f"Error processing question '{question}' in {processing_time:.2f}s: {str(e)}")
             return {
                 'question': question,
                 'error': str(e),
-                'success': False
+                'success': False,
+                'processing_time': processing_time
             }
     
     def _generate_simple_explanation(self, sql, df):
