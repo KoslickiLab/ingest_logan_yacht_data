@@ -16,6 +16,7 @@ Changes
 
 from __future__ import annotations
 import argparse, math, pathlib, sys, pandas as pd, matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator, FormatStrFormatter
 
 HASH_BITS = 64
 SCALE     = 1_000
@@ -59,6 +60,18 @@ def fig_archive_growth(df: pd.DataFrame, out_prefix: pathlib.Path) -> None:
                  color=TEAL, label="Distinct hashes")
     ax_left.set_yscale("log")
     ax_left.set_xlabel("Year")
+    # Force integer calendar-year ticks at 1-year spacing
+    xmin, xmax = int(df["year"].min()), int(df["year"].max())
+    ax_left.set_xlim(xmin, xmax)
+    ax_left.xaxis.set_major_locator(MultipleLocator(1))
+    ax_left.xaxis.set_major_formatter(FormatStrFormatter('%d'))
+    # Prevent overlapping year labels
+    fig = ax_left.figure
+    w, h = fig.get_size_inches()
+    fig.set_size_inches(w * 1.35, h)  # widen ~35%
+    plt.setp(ax_left.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+    fig.subplots_adjust(bottom=0.18)
+
     ax_left.set_ylabel("Cumulative distinct hashes", color=TEAL)
     ax_left.tick_params(axis='y', labelcolor=TEAL)
     ax_left.grid(axis="y", which="major", linestyle=":", alpha=0.6)
@@ -108,6 +121,17 @@ def fig_discovery_rate(df: pd.DataFrame, out_prefix: pathlib.Path) -> None:
             color=TEAL, label="New hashes / sample")
     ax.set_yscale("log")
     ax.set_xlabel("Year")
+    # Force integer calendar-year ticks at 1-year spacing
+    xmin, xmax = int(df["year"].min()), int(df["year"].max())
+    ax.set_xlim(xmin, xmax)
+    ax.xaxis.set_major_locator(MultipleLocator(1))
+    ax.xaxis.set_major_formatter(FormatStrFormatter('%d'))
+    # Prevent overlapping year labels
+    fig = ax.figure
+    w, h = fig.get_size_inches()
+    fig.set_size_inches(w * 1.35, h)  # widen ~35%
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+    fig.subplots_adjust(bottom=0.18)
     ax.set_ylabel("New hashes per sample", color=TEAL)
     ax.tick_params(axis='y', labelcolor=TEAL)
     ax.grid(axis="y", which="major", linestyle=":", alpha=0.6)
